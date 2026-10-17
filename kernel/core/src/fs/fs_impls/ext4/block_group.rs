@@ -18,15 +18,19 @@
 //! - `inode_cache` — protects the per-group live inode map. Uses double-checked
 //!   locking (read then promote to write on miss). Never held while syncing an
 //!   inode (see [`BlockGroup::sync_inodes`]).
+//! - `metadata_cache` — gives inode-table blocks filesystem-wide identity and
+//!   per-block synchronization; its index lock is never held across block I/O.
 
 use core::fmt;
 
 use super::{
+    buddy_cache::BuddyCache,
     fs::Ext4,
     inode::{Inode, InodeDesc, RawInode},
+    metadata_cache::{MetadataBlockCache, MetadataBlockHandle},
+    nv::Ext4NvState,
     prelude::*,
     super_block::SuperBlock,
-    utils,
 };
 
 /// A block group's allocation domain.
@@ -40,8 +44,6 @@ pub(super) struct BlockGroup {
     /// Group descriptor, block bitmap, and inode bitmap, protected by a single
     /// lock.
     metadata: RwMutex<BlockGroupMetadata>,
-    /// Backing block device (shared with `Ext4` and other groups).
-    block_device: Arc<dyn BlockDevice>,
     /// Cached geometry: first filesystem-wide block number of this group.
     first_block: Ext4Bid,
     /// Cached geometry: last filesystem-wide block number of this group.
@@ -63,13 +65,8 @@ pub(super) struct BlockGroup {
     /// stable identity and lets the filesystem enumerate every dirty inode for a
     /// consistent flush at sync/unmount time.
     inode_cache: RwMutex<BTreeMap<u16, Arc<Inode>>>,
-    /// Serializes inode-slot writes into this group's inode table.
-    ///
-    /// Slot writes are sub-sector, so the block layer turns each into a
-    /// sector read-modify-write; two concurrent writes to slots sharing a
-    /// sector would otherwise lose one update. A leaf lock: only device I/O
-    /// happens while it is held.
-    inode_table_lock: Mutex<()>,
+    /// Filesystem-wide cache shared by all metadata block users.
+    metadata_cache: Arc<MetadataBlockCache>,
 }
 
 impl Debug for BlockGroup {
@@ -81,6 +78,16 @@ impl Debug for BlockGroup {
 }
 
 impl BlockGroup {
+    pub(super) fn pinned_metadata_blocks(&self) -> [Ext4Bid; 3] {
+        let metadata = self.metadata.read();
+        [
+            Ext4Bid::try_from(self.desc_offset / self.block_size)
+                .expect("group descriptor home block fits Ext4Bid"),
+            metadata.desc.block_bitmap_bid(),
+            metadata.desc.inode_bitmap_bid(),
+        ]
+    }
+
     /// Loads a block group from the descriptor table.
     ///
     /// Reads and decodes the group's `RawBlockGroup` at
@@ -92,6 +99,8 @@ impl BlockGroup {
     /// an all-zero bitmap and must still mount).
     pub(super) fn load(
         device: Arc<dyn BlockDevice>,
+        metadata_cache: Arc<MetadataBlockCache>,
+        nv_state: Option<Arc<Ext4NvState>>,
         group_idx: usize,
         sb: &SuperBlock,
         gdt_base_offset: usize,
@@ -102,9 +111,13 @@ impl BlockGroup {
             .ok_or_else(|| {
                 Error::with_message(Errno::EOVERFLOW, "group descriptor offset overflow")
             })?;
-        let raw_group = device
-            .read_val::<RawBlockGroup>(desc_offset)
-            .map_err(|_| Error::with_message(Errno::EIO, "failed to read group descriptor"))?;
+        let raw_group = if let Some(nv_state) = &nv_state {
+            nv_state.read_meta_at::<RawBlockGroup>(desc_offset)?
+        } else {
+            device
+                .read_val::<RawBlockGroup>(desc_offset)
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to read group descriptor"))?
+        };
         let desc = BlockGroupDesc::from(&raw_group);
 
         // Cache geometry from `SuperBlock` at load time.
@@ -128,18 +141,29 @@ impl BlockGroup {
         let block_size = sb.block_size();
 
         // Load the block bitmap and the inode bitmap.
-        let block_bitmap =
-            Self::load_block_bitmap(device.as_ref(), first_block, last_block, &desc)?;
-        let inode_bitmap = Self::load_inode_bitmap(device.as_ref(), nr_inodes_per_group, &desc)?;
+        let block_bitmap = Self::load_block_bitmap(
+            device.as_ref(),
+            nv_state.as_deref(),
+            first_block,
+            last_block,
+            &desc,
+        )?;
+        let inode_bitmap = Self::load_inode_bitmap(
+            device.as_ref(),
+            nv_state.as_deref(),
+            nr_inodes_per_group,
+            &desc,
+        )?;
+        let block_buddy = BuddyCache::from_bitmap(&block_bitmap);
 
         Ok(Self {
             group_idx,
             metadata: RwMutex::new(BlockGroupMetadata {
                 desc: Dirty::new(desc),
                 block_bitmap: Dirty::new(block_bitmap),
+                block_buddy,
                 inode_bitmap: Dirty::new(inode_bitmap),
             }),
-            block_device: device,
             first_block,
             last_block,
             nr_inode_table_blocks_per_group,
@@ -148,7 +172,7 @@ impl BlockGroup {
             block_size,
             desc_offset,
             inode_cache: RwMutex::new(BTreeMap::new()),
-            inode_table_lock: Mutex::new(()),
+            metadata_cache,
         })
     }
 
@@ -211,11 +235,6 @@ impl BlockGroup {
         Ok(())
     }
 
-    /// Locks this group's inode table for a slot read-modify-write.
-    pub(super) fn lock_inode_table(&self) -> MutexGuard<'_, ()> {
-        self.inode_table_lock.lock()
-    }
-
     /// Returns a read guard over the combined group metadata.
     #[cfg(ktest)]
     pub(super) fn metadata(&self) -> RwMutexReadGuard<'_, BlockGroupMetadata> {
@@ -249,12 +268,60 @@ impl BlockGroup {
         self.metadata.read().desc.inode_table_bid()
     }
 
+    pub(super) fn allocated_blocks(&self) -> Vec<Ext4Bid> {
+        let metadata = self.metadata.read();
+        (0..metadata.block_bitmap.len())
+            .filter(|bit| metadata.block_bitmap.is_allocated(*bit))
+            .map(|bit| self.first_block + Ext4Bid::from(bit))
+            .collect()
+    }
+
+    pub(super) fn allocated_inode_offsets(&self) -> Vec<u32> {
+        let metadata = self.metadata.read();
+        (0..metadata.inode_bitmap.len())
+            .filter(|bit| metadata.inode_bitmap.is_allocated(*bit))
+            .map(u32::from)
+            .collect()
+    }
+
+    pub(super) fn is_block_allocated(&self, block: Ext4Bid) -> bool {
+        if block < self.first_block || block > self.last_block {
+            return false;
+        }
+        let Ok(bit) = u16::try_from(block - self.first_block) else {
+            return false;
+        };
+        let metadata = self.metadata.read();
+        bit < metadata.block_bitmap.len() && metadata.block_bitmap.is_allocated(bit)
+    }
+
+    pub(super) fn system_metadata_blocks(&self) -> Vec<Ext4Bid> {
+        let metadata = self.metadata.read();
+        let mut blocks = vec![
+            Ext4Bid::try_from(self.desc_offset / self.block_size)
+                .expect("group descriptor home block fits Ext4Bid"),
+            metadata.desc.block_bitmap_bid(),
+            metadata.desc.inode_bitmap_bid(),
+        ];
+        blocks.extend(
+            metadata.desc.inode_table_bid()
+                ..metadata.desc.inode_table_bid()
+                    + Ext4Bid::from(self.nr_inode_table_blocks_per_group),
+        );
+        blocks
+    }
+
     /// Attempts to allocate up to `count` contiguous blocks within this group.
     ///
     /// Returns `Ok(range)` with filesystem-wide block numbers on success, or an
     /// empty range (`Ok(0..0)`) if the group has no allocatable blocks. Returns
     /// `Err(EIO)` on bitmap/counter corruption.
-    pub(super) fn alloc_blocks(&self, count: u32, sb_free_blocks: u64) -> Result<Range<Ext4Bid>> {
+    pub(super) fn alloc_blocks(
+        &self,
+        count: u32,
+        sb_free_blocks: u64,
+        goal: Ext4Bid,
+    ) -> Result<Range<Ext4Bid>> {
         let group_size = u32::try_from(self.last_block - self.first_block + 1)
             .map_err(|_| Error::with_message(Errno::EOVERFLOW, "block group is too large"))?;
         debug_assert!(group_size <= u32::from(IdBitmap::capacity()));
@@ -265,27 +332,27 @@ impl BlockGroup {
             .min(group_size)
             .min(metadata.desc.free_blocks_count())
             .min(u32::try_from(sb_free_blocks.min(u64::from(u32::MAX))).expect("value is clamped"));
-        let mut requested_count = u16::try_from(requested_count)
+        let requested_count = u16::try_from(requested_count)
             .map_err(|_| Error::with_message(Errno::EOVERFLOW, "block request is too large"))?;
-
-        // TODO: Improve bitmap allocation to reduce fragmentation (e.g., find the
-        // first free block directly instead of retrying with smaller counts).
-        let mut allocated_range = None;
-        while requested_count > 0 {
-            let candidate_range = metadata.block_bitmap.alloc_consecutive(requested_count);
-            if candidate_range.is_some() {
-                allocated_range = candidate_range;
-                break;
-            }
-            requested_count /= 2;
-        }
-
-        let Some(range) = allocated_range else {
+        let alloc_count = requested_count.min(metadata.block_buddy.max_free());
+        let goal_bit = if (self.first_block..=self.last_block).contains(&goal) {
+            u16::try_from(goal - self.first_block).expect("group-local block fits u16")
+        } else {
+            0
+        };
+        let Some(range) =
+            metadata
+                .block_buddy
+                .find_run(&metadata.block_bitmap, alloc_count, goal_bit)
+        else {
             if metadata.desc.free_blocks_count() > 0 {
                 return_errno_with_message!(Errno::EIO, "block bitmap corruption detected");
             }
             return Ok(0..0);
         };
+        if !metadata.allocate_block_range(range.clone()) {
+            return_errno_with_message!(Errno::EIO, "block buddy cache is inconsistent");
+        }
 
         let range_start = Ext4Bid::from(range.start);
         let alloc_count = u32::try_from(range.len()).expect("bitmap range length fits u32");
@@ -296,7 +363,7 @@ impl BlockGroup {
             || metadata.desc.free_blocks_count() < alloc_count
             || sb_free_blocks < u64::from(alloc_count)
         {
-            metadata.block_bitmap.free_consecutive(range);
+            metadata.free_block_range(range);
             return_errno_with_message!(Errno::EIO, "block bitmap corruption detected");
         }
 
@@ -348,6 +415,7 @@ impl BlockGroup {
                 actually_freed += 1;
             }
         }
+        metadata.refresh_block_buddy(range_start..range_end);
 
         let new_free = metadata
             .desc
@@ -438,21 +506,71 @@ impl BlockGroup {
         Ok(true)
     }
 
-    /// Loads and decodes an inode's on-disk descriptor from the inode table.
-    ///
-    /// Inode-table reads go directly to the block device. The inode cache is
-    /// used for identity and enumeration, not for inode-table pages.
+    /// Loads and decodes an inode descriptor through the whole-block cache.
     pub(super) fn read_inode_desc(&self, ino: Ext4Ino) -> Result<InodeDesc> {
+        let (table_bid, slot_offset) = self.inode_slot_location(ino)?;
+        self.metadata_cache.read(table_bid, |block| {
+            let slot = block
+                .get(slot_offset..slot_offset + self.inode_size)
+                .ok_or_else(|| Error::with_message(Errno::EIO, "inode slot crosses table block"))?;
+            let raw = RawInode::decode_slot(slot, self.inode_size)?;
+            InodeDesc::try_from(&raw)
+        })
+    }
+
+    /// Updates one inode slot and returns its shared metadata-block handle.
+    pub(super) fn update_inode_desc(
+        &self,
+        ino: Ext4Ino,
+        update: impl FnOnce(&mut RawInode) -> Result<()>,
+    ) -> Result<MetadataBlockHandle> {
+        let (table_bid, slot_offset) = self.inode_slot_location(ino)?;
+        self.metadata_cache.modify(table_bid, |block| {
+            let slot = block
+                .get_mut(slot_offset..slot_offset + self.inode_size)
+                .ok_or_else(|| Error::with_message(Errno::EIO, "inode slot crosses table block"))?;
+            let mut raw = RawInode::decode_slot(slot, self.inode_size)?;
+            update(&mut raw)?;
+            raw.encode_slot(slot, self.inode_size)
+        })
+    }
+
+    /// Replaces one new inode slot and returns its shared metadata-block handle.
+    pub(super) fn write_new_inode_desc(
+        &self,
+        ino: Ext4Ino,
+        raw: &RawInode,
+    ) -> Result<(MetadataBlockHandle, RawInode)> {
+        let mut old_raw = None;
+        let dependency = self.update_inode_desc(ino, |cached| {
+            old_raw = Some(*cached);
+            *cached = *raw;
+            Ok(())
+        })?;
+        Ok((dependency, old_raw.unwrap()))
+    }
+
+    #[cfg(ktest)]
+    pub(super) fn invalidate_inode_table_block(&self, ino: Ext4Ino) {
+        if let Ok((table_bid, _)) = self.inode_slot_location(ino) {
+            self.metadata_cache.invalidate(table_bid);
+        }
+    }
+
+    fn inode_slot_location(&self, ino: Ext4Ino) -> Result<(Ext4Bid, usize)> {
         let idx_in_group = usize::from(self.inode_idx_in_group(ino));
-        let inode_table_offset = utils::block_offset(self.inode_table_bid(), self.block_size)?;
-        let inode_slot_offset = idx_in_group
+        let byte_offset = idx_in_group
             .checked_mul(self.inode_size)
             .ok_or_else(|| Error::with_message(Errno::EOVERFLOW, "inode slot offset overflow"))?;
-        let offset = inode_table_offset
-            .checked_add(inode_slot_offset)
-            .ok_or_else(|| Error::with_message(Errno::EOVERFLOW, "inode table offset overflow"))?;
-        let raw = RawInode::read_from_slot(&self.block_device, offset, self.inode_size)?;
-        InodeDesc::try_from(&raw)
+        let table_block_idx = byte_offset / self.block_size;
+        if table_block_idx >= self.nr_inode_table_blocks_per_group as usize {
+            return_errno_with_message!(Errno::EIO, "inode slot exceeds inode table");
+        }
+        let table_bid = self
+            .inode_table_bid()
+            .checked_add(table_block_idx as Ext4Bid)
+            .ok_or_else(|| Error::with_message(Errno::EOVERFLOW, "inode table block overflow"))?;
+        Ok((table_bid, byte_offset % self.block_size))
     }
 
     /// Writes dirty metadata back to disk under a single lock.
@@ -467,58 +585,53 @@ impl BlockGroup {
 
         if metadata.block_bitmap.is_dirty() {
             let block_bitmap_bid = metadata.desc.block_bitmap_bid();
-            if self
-                .block_device
-                .write_bytes(
-                    Bid::new(block_bitmap_bid).to_offset(),
-                    metadata.block_bitmap.as_bytes(),
-                )
-                .is_err()
-            {
-                // Keep the dirty bit set on writeback failure for retry.
-                return_errno_with_message!(Errno::EIO, "failed to write block bitmap");
-            }
+            let handle = self.metadata_cache.modify(block_bitmap_bid, |bytes| {
+                bytes.copy_from_slice(metadata.block_bitmap.as_bytes());
+                Ok(())
+            })?;
+            self.metadata_cache.sync(&handle)?;
             metadata.block_bitmap.clear_dirty();
         }
 
         if metadata.inode_bitmap.is_dirty() {
             let inode_bitmap_bid = metadata.desc.inode_bitmap_bid();
-            if self
-                .block_device
-                .write_bytes(
-                    Bid::new(inode_bitmap_bid).to_offset(),
-                    metadata.inode_bitmap.as_bytes(),
-                )
-                .is_err()
-            {
-                // Keep the dirty bit set on writeback failure for retry.
-                return_errno_with_message!(Errno::EIO, "failed to write inode bitmap");
-            }
+            let handle = self.metadata_cache.modify(inode_bitmap_bid, |bytes| {
+                bytes.copy_from_slice(metadata.inode_bitmap.as_bytes());
+                Ok(())
+            })?;
+            self.metadata_cache.sync(&handle)?;
             metadata.inode_bitmap.clear_dirty();
         }
 
         if metadata.desc.is_dirty() {
-            let mut raw = self
-                .block_device
-                .read_val::<RawBlockGroup>(self.desc_offset)
-                .map_err(|_| {
-                    Error::with_message(Errno::EIO, "failed to read group descriptor for sync")
-                })?;
-            raw.free_blocks_count_lo =
-                u16::try_from(metadata.desc.free_blocks_count()).map_err(|_| {
-                    Error::with_message(Errno::EOVERFLOW, "free block count exceeds disk field")
-                })?;
-            raw.free_inodes_count_lo =
-                u16::try_from(metadata.desc.free_inodes_count()).map_err(|_| {
-                    Error::with_message(Errno::EOVERFLOW, "free inode count exceeds disk field")
-                })?;
-            raw.used_dirs_count_lo =
-                u16::try_from(metadata.desc.used_dirs_count()).map_err(|_| {
-                    Error::with_message(Errno::EOVERFLOW, "directory count exceeds disk field")
-                })?;
-            self.block_device
-                .write_val(self.desc_offset, &raw)
-                .map_err(|_| Error::with_message(Errno::EIO, "failed to write group descriptor"))?;
+            let free_blocks = u16::try_from(metadata.desc.free_blocks_count()).map_err(|_| {
+                Error::with_message(Errno::EOVERFLOW, "free block count exceeds disk field")
+            })?;
+            let free_inodes = u16::try_from(metadata.desc.free_inodes_count()).map_err(|_| {
+                Error::with_message(Errno::EOVERFLOW, "free inode count exceeds disk field")
+            })?;
+            let used_dirs = u16::try_from(metadata.desc.used_dirs_count()).map_err(|_| {
+                Error::with_message(Errno::EOVERFLOW, "directory count exceeds disk field")
+            })?;
+            let gdt_bid = Ext4Bid::try_from(self.desc_offset / self.block_size)
+                .map_err(|_| Error::new(Errno::EOVERFLOW))?;
+            let desc_offset_in_block = self.desc_offset % self.block_size;
+            let handle = self.metadata_cache.modify(gdt_bid, |bytes| {
+                let desc_bytes = bytes
+                    .get_mut(
+                        desc_offset_in_block..desc_offset_in_block + size_of::<RawBlockGroup>(),
+                    )
+                    .ok_or_else(|| {
+                        Error::with_message(Errno::EIO, "group descriptor crosses block")
+                    })?;
+                let mut raw = RawBlockGroup::from_bytes(desc_bytes);
+                raw.free_blocks_count_lo = free_blocks;
+                raw.free_inodes_count_lo = free_inodes;
+                raw.used_dirs_count_lo = used_dirs;
+                desc_bytes.copy_from_slice(raw.as_bytes());
+                Ok(())
+            })?;
+            self.metadata_cache.sync(&handle)?;
             metadata.desc.clear_dirty();
         }
 
@@ -540,6 +653,7 @@ impl BlockGroup {
     /// Loads the block bitmap for this group.
     fn load_block_bitmap(
         block_device: &dyn BlockDevice,
+        nv_state: Option<&Ext4NvState>,
         first_block: Ext4Bid,
         last_block: Ext4Bid,
         desc: &BlockGroupDesc,
@@ -547,10 +661,14 @@ impl BlockGroup {
         let bitmap_bid = desc.block_bitmap_bid();
 
         let mut buf = vec![0u8; BLOCK_SIZE];
-        if block_device
-            .read_bytes(Bid::new(bitmap_bid).to_offset(), &mut buf)
-            .is_err()
-        {
+        let read_result = if let Some(nv_state) = nv_state {
+            nv_state.read_meta_block(bitmap_bid)?.read(&mut buf)
+        } else {
+            block_device
+                .read_bytes(Bid::new(bitmap_bid).to_offset(), &mut buf)
+                .map_err(Into::into)
+        };
+        if read_result.is_err() {
             return_errno_with_message!(Errno::EIO, "failed to read block bitmap");
         }
 
@@ -568,16 +686,21 @@ impl BlockGroup {
     /// as many bits as inodes a group can have).
     fn load_inode_bitmap(
         block_device: &dyn BlockDevice,
+        nv_state: Option<&Ext4NvState>,
         nr_inodes_per_group: u32,
         desc: &BlockGroupDesc,
     ) -> Result<IdBitmap> {
         let bitmap_bid = desc.inode_bitmap_bid();
 
         let mut buf = vec![0u8; BLOCK_SIZE];
-        if block_device
-            .read_bytes(Bid::new(bitmap_bid).to_offset(), &mut buf)
-            .is_err()
-        {
+        let read_result = if let Some(nv_state) = nv_state {
+            nv_state.read_meta_block(bitmap_bid)?.read(&mut buf)
+        } else {
+            block_device
+                .read_bytes(Bid::new(bitmap_bid).to_offset(), &mut buf)
+                .map_err(Into::into)
+        };
+        if read_result.is_err() {
             return_errno_with_message!(Errno::EIO, "failed to read inode bitmap");
         }
 
@@ -619,8 +742,34 @@ pub(super) struct BlockGroupMetadata {
     pub desc: Dirty<BlockGroupDesc>,
     /// Block bitmap cached in memory.
     pub block_bitmap: Dirty<IdBitmap>,
+    /// In-memory free-run index derived from `block_bitmap`.
+    block_buddy: BuddyCache,
     /// Inode bitmap cached in memory.
     pub inode_bitmap: Dirty<IdBitmap>,
+}
+
+impl BlockGroupMetadata {
+    fn allocate_block_range(&mut self, range: Range<u16>) -> bool {
+        if !self.block_bitmap.alloc_exact(range.clone()) {
+            return false;
+        }
+        self.refresh_block_buddy(range);
+        true
+    }
+
+    fn free_block_range(&mut self, range: Range<u16>) {
+        self.block_bitmap.free_consecutive(range.clone());
+        self.refresh_block_buddy(range);
+    }
+
+    fn refresh_block_buddy(&mut self, range: Range<u16>) {
+        let Self {
+            block_bitmap,
+            block_buddy,
+            ..
+        } = self;
+        block_buddy.refresh_range(block_bitmap, range);
+    }
 }
 
 impl Debug for BlockGroupMetadata {
@@ -707,3 +856,5 @@ pub(super) struct RawBlockGroup {
 }
 
 const_assert!(size_of::<RawBlockGroup>() == 32);
+
+impl crate::fs::fs_impls::ext4::nv::persistent::Sealed for RawBlockGroup {}

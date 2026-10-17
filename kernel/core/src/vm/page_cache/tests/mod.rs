@@ -10,9 +10,18 @@ use ostd::{
     prelude::ktest,
 };
 
-use self::utils::{IoCompletion, IoKind, MockPageCacheBackend, wait_until};
-use super::{PageCache, PageCacheBackend, Vmo, VmoCommitError, VmoMapMode};
-use crate::{prelude::*, thread::kernel_thread::ThreadOptions};
+use self::utils::{
+    IoCompletion, IoKind, MockDirectPageCacheBackend, MockPageCacheBackend, wait_until,
+};
+use super::{
+    PageCache, PageCacheBackend, Vmo, VmoCommitError, VmoMapMode, WritebackBatchResult,
+    WritebackMode,
+};
+use crate::{
+    prelude::*,
+    thread::{Thread, kernel_thread::ThreadOptions},
+    vm::page_cache::vmo::PageCacheMark,
+};
 
 mod utils;
 
@@ -47,6 +56,635 @@ fn write_vmo_bytes(vmo: &Vmo, bytes: &[u8]) {
     let mut reader = VmReader::from(bytes);
     let mut writer = page.writer();
     assert_eq!(writer.write(&mut reader), bytes.len());
+}
+
+/// Dirty-page discovery merges adjacent pages while preserving holes and the
+/// caller's byte-range boundary. Filesystems use this snapshot to drive
+/// delayed allocation before writeback.
+#[ktest]
+fn dirty_ranges_merge_adjacent_pages_and_preserve_holes() {
+    let backend = MockPageCacheBackend::new(5);
+    let page_cache = new_backend_page_cache(&backend, 5);
+
+    page_cache.write_bytes(0, &[0x11]).unwrap();
+    page_cache.write_bytes(PAGE_SIZE, &[0x22]).unwrap();
+    page_cache.write_bytes(3 * PAGE_SIZE, &[0x33]).unwrap();
+
+    assert_eq!(
+        page_cache.dirty_ranges(PAGE_SIZE / 2..4 * PAGE_SIZE),
+        vec![PAGE_SIZE / 2..2 * PAGE_SIZE, 3 * PAGE_SIZE..4 * PAGE_SIZE]
+    );
+}
+
+/// A large flush must complete bounded windows instead of snapshotting the
+/// entire dirty set before waiting for any I/O completion.
+#[ktest]
+fn flush_range_limits_each_backend_batch() {
+    const BATCH_PAGES: usize = 1024;
+    const NUM_PAGES: usize = BATCH_PAGES + 1;
+
+    let backend = MockPageCacheBackend::new(NUM_PAGES);
+    let page_cache = new_backend_page_cache(&backend, NUM_PAGES);
+    page_cache
+        .write_bytes(0, &vec![0x5a; NUM_PAGES * PAGE_SIZE])
+        .unwrap();
+
+    page_cache.flush_range(0..NUM_PAGES * PAGE_SIZE).unwrap();
+
+    assert_eq!(backend.write_batch_sizes(), vec![BATCH_PAGES, 1]);
+    assert_eq!(backend.write_count(0), 1);
+    assert_eq!(backend.write_count(NUM_PAGES - 1), 1);
+}
+
+#[ktest]
+fn flush_range_batch_rejects_zero_page_limit() {
+    let backend = MockPageCacheBackend::new(1);
+    let page_cache = new_backend_page_cache(&backend, 1);
+
+    assert_eq!(
+        page_cache
+            .flush_range_batch(0..PAGE_SIZE, 0)
+            .unwrap_err()
+            .error(),
+        Errno::EINVAL
+    );
+}
+
+#[ktest]
+fn direct_backend_requires_explicit_detached_completion_opt_in() {
+    let backend = Arc::new(MockDirectPageCacheBackend::new());
+    let backend_dyn: Arc<dyn PageCacheBackend> = backend.clone();
+    let page_cache = Arc::new(RwMutex::new(
+        PageCache::new_with_backend(PAGE_SIZE, Arc::downgrade(&backend_dyn)).unwrap(),
+    ));
+    page_cache.write().write_bytes(0, &[0x11]).unwrap();
+    let result = Arc::new(Mutex::new(None::<Result<()>>));
+    let thread = {
+        let page_cache = page_cache.clone();
+        let result = result.clone();
+        ThreadOptions::new(move || {
+            *result.lock() = Some(page_cache.read().flush_range(0..PAGE_SIZE));
+        })
+        .spawn()
+    };
+
+    assert!(backend.writeback_observer().is_some());
+    assert!(backend.writeback_completion_dispatcher().is_none());
+    backend.wait_for_write_submission();
+    assert!(result.lock().is_none());
+    backend.complete_write();
+    thread.join();
+    assert!(result.lock().take().unwrap().is_ok());
+}
+
+/// A detached completion must not erase a write that raced after its snapshot.
+#[ktest]
+fn detached_completion_preserves_concurrent_redirty() {
+    let (backend, dispatcher) = MockPageCacheBackend::new_with_detached_writeback(1);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+    let page_cache = new_backend_page_cache(&backend, 1);
+    let vmo = page_cache.as_vmo().clone();
+    page_cache.write_bytes(0, &[0x11]).unwrap();
+
+    page_cache
+        .flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Background)
+        .unwrap();
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+    write_vmo_bytes(&vmo, &[0x22]);
+
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, true));
+    assert!(dispatcher.finish_next().unwrap().is_ok());
+    assert_eq!(page_cache.dirty_ranges(0..PAGE_SIZE), vec![0..PAGE_SIZE]);
+}
+
+/// A failed detached completion must restore Dirty after ending Writeback.
+#[ktest]
+fn detached_completion_failure_redirties_and_returns_io_error() {
+    let (backend, dispatcher) = MockPageCacheBackend::new_with_detached_writeback(1);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+    let page_cache = new_backend_page_cache(&backend, 1);
+    page_cache.write_bytes(0, &[0x11]).unwrap();
+
+    page_cache
+        .flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Background)
+        .unwrap();
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, false));
+    assert_eq!(
+        dispatcher.finish_next().unwrap().unwrap_err().error(),
+        Errno::EIO
+    );
+    assert_eq!(page_cache.dirty_ranges(0..PAGE_SIZE), vec![0..PAGE_SIZE]);
+}
+
+/// A consumed prepared completion cannot be finished a second time.
+#[ktest]
+fn detached_completion_is_finished_exactly_once() {
+    let (backend, dispatcher) = MockPageCacheBackend::new_with_detached_writeback(1);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+    let page_cache = new_backend_page_cache(&backend, 1);
+    page_cache.write_bytes(0, &[0x11]).unwrap();
+
+    page_cache
+        .flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Background)
+        .unwrap();
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+    assert_eq!(dispatcher.prepared_count(), 1);
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, true));
+    assert!(dispatcher.finish_next().unwrap().is_ok());
+    assert!(dispatcher.finish_next().is_none());
+}
+
+/// Backends without a dispatcher continue to wait through `IoBatch::wait_all`.
+#[ktest]
+fn default_writeback_backend_waits_for_io_batch() {
+    let backend = MockPageCacheBackend::new(1);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+    let page_cache = new_locked_backend_page_cache(&backend, 1);
+    page_cache.write().write_bytes(0, &[0x11]).unwrap();
+    let result = Arc::new(Mutex::new(None::<Result<()>>));
+    let thread = {
+        let page_cache = page_cache.clone();
+        let result = result.clone();
+        ThreadOptions::new(move || {
+            *result.lock() = Some(page_cache.read().flush_range(0..PAGE_SIZE));
+        })
+        .spawn()
+    };
+
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+    assert!(result.lock().is_none());
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, true));
+    thread.join();
+    assert!(result.lock().take().unwrap().is_ok());
+}
+
+#[ktest]
+fn sync_detached_writeback_waits_through_its_fence() {
+    let (backend, dispatcher) = MockPageCacheBackend::new_with_detached_writeback(1);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+    let page_cache = new_locked_backend_page_cache(&backend, 1);
+    page_cache.write().write_bytes(0, &[0x11]).unwrap();
+    let result = Arc::new(Mutex::new(None::<Result<()>>));
+    let thread = {
+        let page_cache = page_cache.clone();
+        let result = result.clone();
+        ThreadOptions::new(move || {
+            *result.lock() = Some(
+                page_cache
+                    .read()
+                    .flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Sync)
+                    .and_then(WritebackBatchResult::wait),
+            );
+        })
+        .spawn()
+    };
+
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+    assert_eq!(dispatcher.wait_count(), 1);
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, true));
+    thread.join();
+    assert!(result.lock().take().unwrap().is_ok());
+    assert_eq!(dispatcher.wait_count(), 2);
+}
+
+#[ktest]
+fn sync_detached_writeback_waits_for_completion_credit() {
+    let (backend, dispatcher) = MockPageCacheBackend::new_with_detached_writeback(2);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+    dispatcher.set_max_prepared(1);
+    let page_cache = Arc::new(new_backend_page_cache(&backend, 2));
+    page_cache
+        .write_bytes(0, &vec![0x11; 2 * PAGE_SIZE])
+        .unwrap();
+
+    page_cache
+        .flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Background)
+        .unwrap();
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+
+    let result = Arc::new(Mutex::new(None::<Result<()>>));
+    let sync_thread = {
+        let page_cache = page_cache.clone();
+        let result = result.clone();
+        ThreadOptions::new(move || {
+            *result.lock() = Some(page_cache.flush_range(PAGE_SIZE..2 * PAGE_SIZE));
+        })
+        .spawn()
+    };
+
+    while dispatcher.wait_count() == 0 && result.lock().is_none() {
+        Thread::yield_now();
+    }
+    assert!(dispatcher.wait_count() > 0);
+    assert!(result.lock().is_none());
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, true));
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, true));
+    sync_thread.join();
+
+    assert!(result.lock().take().unwrap().is_ok());
+    assert_eq!(backend.write_count(0), 1);
+    assert_eq!(backend.write_count(1), 1);
+}
+
+#[ktest]
+fn sync_observes_failure_from_an_already_inflight_page() {
+    let (backend, dispatcher) = MockPageCacheBackend::new_with_detached_writeback(1);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+    let page_cache = Arc::new(new_backend_page_cache(&backend, 1));
+    page_cache.write_bytes(0, &[0x11]).unwrap();
+
+    page_cache
+        .flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Background)
+        .unwrap();
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+    let result = Arc::new(Mutex::new(None::<Result<WritebackBatchResult>>));
+    let sync_thread = {
+        let page_cache = page_cache.clone();
+        let result = result.clone();
+        ThreadOptions::new(move || {
+            *result.lock() =
+                Some(page_cache.flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Sync));
+        })
+        .spawn()
+    };
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, false));
+    sync_thread.join();
+
+    let error = match result.lock().take().unwrap() {
+        Ok(_) => panic!("sync unexpectedly ignored the in-flight writeback failure"),
+        Err(error) => error,
+    };
+    assert_eq!(error.error(), Errno::EIO);
+    assert_eq!(dispatcher.wait_count(), 2);
+    assert_eq!(page_cache.dirty_ranges(0..PAGE_SIZE), vec![0..PAGE_SIZE]);
+}
+
+#[ktest]
+fn sync_closes_writeback_sequence_registration_window() {
+    let (backend, dispatcher) = MockPageCacheBackend::new_with_detached_writeback(1);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+    dispatcher.pause_prepare();
+    let page_cache = Arc::new(new_backend_page_cache(&backend, 1));
+    page_cache.write_bytes(0, &[0x11]).unwrap();
+
+    let background = {
+        let page_cache = page_cache.clone();
+        ThreadOptions::new(move || {
+            page_cache
+                .flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Background)
+                .unwrap();
+        })
+        .spawn()
+    };
+    dispatcher.wait_until_prepare_entered();
+
+    let result = Arc::new(Mutex::new(None::<Result<WritebackBatchResult>>));
+    let sync_thread = {
+        let page_cache = page_cache.clone();
+        let result = result.clone();
+        ThreadOptions::new(move || {
+            *result.lock() =
+                Some(page_cache.flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Sync));
+        })
+        .spawn()
+    };
+    for _ in 0..32 {
+        Thread::yield_now();
+    }
+    assert!(result.lock().is_none());
+
+    dispatcher.resume_prepare();
+    background.join();
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, false));
+    assert!(dispatcher.finish_next().unwrap().is_err());
+    sync_thread.join();
+
+    let error = match result.lock().take().unwrap() {
+        Ok(_) => panic!("sync unexpectedly ignored the registration-window failure"),
+        Err(error) => error,
+    };
+    assert_eq!(error.error(), Errno::EIO);
+    assert_eq!(page_cache.dirty_ranges(0..PAGE_SIZE), vec![0..PAGE_SIZE]);
+}
+
+#[ktest]
+fn detached_batch_fence_excludes_later_submission() {
+    let (backend, dispatcher) = MockPageCacheBackend::new_with_detached_writeback(2);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+    let page_cache = new_backend_page_cache(&backend, 2);
+
+    page_cache.write_bytes(0, &[0x11]).unwrap();
+    let first_batch = page_cache
+        .flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Background)
+        .unwrap();
+    page_cache.write_bytes(PAGE_SIZE, &[0x22]).unwrap();
+    let _second_batch = page_cache
+        .flush_range_batch_with_mode(PAGE_SIZE..2 * PAGE_SIZE, 1, WritebackMode::Background)
+        .unwrap();
+    backend.wait_for_deferred_bios(IoKind::Write, 2);
+
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, true));
+    first_batch.wait().unwrap();
+
+    assert_eq!(dispatcher.prepared_count(), 1);
+    assert_eq!(dispatcher.wait_count(), 1);
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, true));
+    assert!(dispatcher.finish_next().unwrap().is_ok());
+}
+
+#[ktest]
+fn detached_prepare_failure_finishes_writeback_and_redirties_page() {
+    let (backend, dispatcher) = MockPageCacheBackend::new_with_detached_writeback(1);
+    dispatcher.set_fail_prepare(true);
+    let page_cache = new_backend_page_cache(&backend, 1);
+    page_cache.write_bytes(0, &[0x11]).unwrap();
+
+    let err =
+        match page_cache.flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Background) {
+            Ok(_) => panic!("prepare failure unexpectedly produced a batch result"),
+            Err(err) => err,
+        };
+    assert_eq!(err.error(), Errno::EIO);
+    assert_eq!(page_cache.dirty_ranges(0..PAGE_SIZE), vec![0..PAGE_SIZE]);
+}
+
+#[ktest]
+fn detached_submit_failure_finishes_prepared_completion() {
+    let (backend, dispatcher) = MockPageCacheBackend::new_with_detached_writeback(1);
+    backend.set_write_submit_failure(0, true);
+    let page_cache = new_backend_page_cache(&backend, 1);
+    page_cache.write_bytes(0, &[0x11]).unwrap();
+
+    let err =
+        match page_cache.flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Background) {
+            Ok(_) => panic!("submit failure unexpectedly produced a batch result"),
+            Err(err) => err,
+        };
+    assert_eq!(err.error(), Errno::EIO);
+    assert_eq!(dispatcher.prepared_count(), 0);
+    assert_eq!(page_cache.dirty_ranges(0..PAGE_SIZE), vec![0..PAGE_SIZE]);
+}
+
+#[ktest]
+fn background_detached_writeback_skips_existing_writeback_pages() {
+    let (backend, dispatcher) = MockPageCacheBackend::new_with_detached_writeback(1);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+    let page_cache = new_backend_page_cache(&backend, 1);
+    let vmo = page_cache.as_vmo().clone();
+    page_cache.write_bytes(0, &[0x11]).unwrap();
+
+    page_cache
+        .flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Background)
+        .unwrap();
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+    write_vmo_bytes(&vmo, &[0x22]);
+    let second_batch = page_cache
+        .flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Background)
+        .unwrap();
+
+    assert_eq!(backend.write_count(0), 1);
+    assert_eq!(dispatcher.prepared_count(), 1);
+    assert!(!second_batch.had_work());
+    assert!(second_batch.retry_after_completion());
+
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, true));
+    assert!(dispatcher.finish_next().unwrap().is_ok());
+    page_cache
+        .flush_range_batch_with_mode(0..PAGE_SIZE, 1, WritebackMode::Background)
+        .unwrap();
+    assert_eq!(backend.write_count(0), 2);
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, true));
+    assert!(dispatcher.finish_next().unwrap().is_ok());
+}
+
+#[ktest]
+fn later_submit_failure_does_not_finish_an_earlier_prepared_completion() {
+    let (backend, dispatcher) = MockPageCacheBackend::new_with_detached_writeback(2);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+    backend.set_write_submit_failure(1, true);
+    let page_cache = new_backend_page_cache(&backend, 2);
+    page_cache
+        .write_bytes(0, &vec![0x11; 2 * PAGE_SIZE])
+        .unwrap();
+
+    let err = match page_cache.flush_range_batch_with_mode(
+        0..2 * PAGE_SIZE,
+        2,
+        WritebackMode::Background,
+    ) {
+        Ok(_) => panic!("later submit failure unexpectedly produced a batch result"),
+        Err(err) => err,
+    };
+    assert_eq!(err.error(), Errno::EIO);
+    assert_eq!(dispatcher.prepared_count(), 1);
+    assert_eq!(backend.write_count(0), 1);
+    assert_eq!(backend.write_count(1), 1);
+
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, true));
+    assert!(dispatcher.finish_next().unwrap().is_ok());
+    assert_eq!(
+        page_cache.dirty_ranges(0..2 * PAGE_SIZE),
+        vec![PAGE_SIZE..2 * PAGE_SIZE]
+    );
+}
+
+/// Dirty accounting follows page generations rather than write calls.
+#[ktest]
+fn writeback_observer_counts_dirty_generations() {
+    let backend = MockPageCacheBackend::new(1);
+    let page_cache = new_locked_backend_page_cache(&backend, 1);
+
+    page_cache.write().write_bytes(0, &[0x11]).unwrap();
+    page_cache.write().write_bytes(1, &[0x22]).unwrap();
+    assert_eq!(backend.outstanding_pages(), 1);
+
+    page_cache.read().flush_range(0..PAGE_SIZE).unwrap();
+    assert_eq!(backend.outstanding_pages(), 0);
+}
+
+#[ktest]
+fn pre_submission_failure_preserves_one_outstanding_page() {
+    let backend = MockPageCacheBackend::new(1);
+    let page_cache = new_backend_page_cache(&backend, 1);
+    page_cache.write_bytes(0, &[0x11]).unwrap();
+    assert_eq!(backend.outstanding_pages(), 1);
+
+    backend.set_fail_write_batch_before_submission(true);
+    assert_eq!(
+        page_cache.flush_range(0..PAGE_SIZE).unwrap_err().error(),
+        Errno::EIO
+    );
+    assert_eq!(backend.outstanding_pages(), 1);
+
+    backend.set_fail_write_batch_before_submission(false);
+    page_cache.flush_range(0..PAGE_SIZE).unwrap();
+    assert_eq!(backend.outstanding_pages(), 0);
+}
+
+#[ktest]
+fn partial_batch_submission_failure_preserves_per_page_accounting() {
+    let backend = MockPageCacheBackend::new(2);
+    let page_cache = new_backend_page_cache(&backend, 2);
+    page_cache
+        .write_bytes(0, &vec![0x11; 2 * PAGE_SIZE])
+        .unwrap();
+    assert_eq!(backend.outstanding_pages(), 2);
+
+    backend.set_write_submit_failure(1, true);
+    assert_eq!(
+        page_cache
+            .flush_range(0..2 * PAGE_SIZE)
+            .unwrap_err()
+            .error(),
+        Errno::EIO
+    );
+    assert_eq!(backend.outstanding_pages(), 1);
+
+    backend.set_write_submit_failure(1, false);
+    page_cache.flush_range(0..2 * PAGE_SIZE).unwrap();
+    assert_eq!(backend.outstanding_pages(), 0);
+}
+
+/// Truncating a dirty page discards its pending generation and must release
+/// the owner's dirty-page budget.
+#[ktest]
+fn truncate_releases_dirty_generation_accounting() {
+    let backend = MockPageCacheBackend::new(2);
+    let mut page_cache = new_backend_page_cache(&backend, 2);
+    page_cache.write_bytes(PAGE_SIZE, &[0x33]).unwrap();
+    assert_eq!(backend.outstanding_pages(), 1);
+
+    page_cache.resize(PAGE_SIZE, 2 * PAGE_SIZE).unwrap();
+    assert_eq!(backend.outstanding_pages(), 0);
+}
+
+/// Dirty and writeback marks are independent secondary indexes, and marked
+/// range lookup must not visit candidates outside the requested range.
+#[ktest]
+fn page_state_marks_are_independent_and_range_bounded() {
+    let backend = MockPageCacheBackend::new(8);
+    let page_cache = new_backend_page_cache(&backend, 8);
+    let vmo = page_cache.as_vmo();
+    let backed_vmo = vmo.as_backed_vmo().unwrap();
+
+    let mut byte = [0u8; 1];
+    for index in [1, 3, 6] {
+        page_cache.read_bytes(index * PAGE_SIZE, &mut byte).unwrap();
+    }
+
+    let (page1, _) = vmo
+        .try_commit_page(PAGE_SIZE, VmoMapMode::SharedRead)
+        .unwrap();
+    let (page3, _) = vmo
+        .try_commit_page(3 * PAGE_SIZE, VmoMapMode::SharedRead)
+        .unwrap();
+    let (page6, _) = vmo
+        .try_commit_page(6 * PAGE_SIZE, VmoMapMode::SharedRead)
+        .unwrap();
+
+    assert!(backed_vmo.set_page_mark_if_same(1, &page1, PageCacheMark::Dirty));
+    assert!(backed_vmo.set_page_mark_if_same(3, &page3, PageCacheMark::Writeback));
+    assert!(backed_vmo.set_page_mark_if_same(6, &page6, PageCacheMark::Dirty));
+
+    let dirty_indices: Vec<_> = backed_vmo
+        .collect_marked_pages(&(2..7), PageCacheMark::Dirty)
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect();
+    let writeback_indices: Vec<_> = backed_vmo
+        .collect_marked_pages(&(0..8), PageCacheMark::Writeback)
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect();
+
+    assert_eq!(dirty_indices, vec![6]);
+    assert_eq!(writeback_indices, vec![3]);
+}
+
+/// Every backend-page dirtying path must publish the Dirty XArray mark, while
+/// read-only page commits must not create false dirty candidates.
+#[ktest]
+fn buffered_and_mapped_writes_publish_dirty_marks() {
+    let backend = MockPageCacheBackend::new(3);
+    let page_cache = new_backend_page_cache(&backend, 3);
+    let vmo = page_cache.as_vmo();
+
+    page_cache.write_bytes(0, &[0x31]).unwrap();
+
+    let mut clean_byte = [0u8; 1];
+    page_cache.read_bytes(PAGE_SIZE, &mut clean_byte).unwrap();
+
+    vmo.commit_on(2, VmoMapMode::SharedWrite).unwrap();
+    let (mapped_page, _) = vmo
+        .try_commit_page(2 * PAGE_SIZE, VmoMapMode::SharedWrite)
+        .unwrap();
+    let mut mapped_reader = VmReader::from(&[0x72u8][..]);
+    assert_eq!(mapped_page.writer().write(&mut mapped_reader), 1);
+
+    let dirty_indices: Vec<_> = vmo
+        .as_backed_vmo()
+        .unwrap()
+        .collect_marked_pages(&(0..3), PageCacheMark::Dirty)
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect();
+
+    assert_eq!(dirty_indices, vec![0, 2]);
+}
+
+/// A page moves from the Dirty index to the Writeback index while its BIO is
+/// in flight, then leaves both indexes after successful completion.
+#[ktest]
+fn writeback_marks_follow_inflight_io() {
+    let backend = MockPageCacheBackend::new(1);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+
+    let page_cache = new_locked_backend_page_cache(&backend, 1);
+    let vmo = page_cache.read().as_vmo().clone();
+    page_cache.write().write_bytes(0, &[0x5a]).unwrap();
+
+    let flush_result = Arc::new(Mutex::new(None::<Result<()>>));
+    let flush_thread = {
+        let page_cache = page_cache.clone();
+        let flush_result = flush_result.clone();
+        ThreadOptions::new(move || {
+            *flush_result.lock() = Some(page_cache.read().flush_range(0..PAGE_SIZE));
+        })
+        .spawn()
+    };
+
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+    let backed_vmo = vmo.as_backed_vmo().unwrap();
+    assert!(
+        backed_vmo
+            .collect_marked_pages(&(0..1), PageCacheMark::Dirty)
+            .is_empty()
+    );
+    assert_eq!(
+        backed_vmo
+            .collect_marked_pages(&(0..1), PageCacheMark::Writeback)
+            .len(),
+        1
+    );
+
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, true));
+    flush_thread.join();
+    assert!(flush_result.lock().take().unwrap().is_ok());
+    assert!(
+        backed_vmo
+            .collect_marked_pages(&(0..1), PageCacheMark::Dirty)
+            .is_empty()
+    );
+    assert!(
+        backed_vmo
+            .collect_marked_pages(&(0..1), PageCacheMark::Writeback)
+            .is_empty()
+    );
 }
 
 /// Serializes a cold read and a later overwrite with the caller-provided
@@ -133,6 +771,7 @@ fn concurrent_write_and_flush() {
         .write()
         .write_bytes(0, &first_dirty_pattern)
         .unwrap();
+    assert_eq!(backend.outstanding_pages(), 1);
 
     let flush_result = Arc::new(Mutex::new(None::<Result<()>>));
     let writer_finished = Arc::new(Mutex::new(false));
@@ -165,12 +804,14 @@ fn concurrent_write_and_flush() {
 
     writer_thread.join();
     assert!(*writer_finished.lock());
+    assert_eq!(backend.outstanding_pages(), 1);
 
     // Complete the first writeback, then flush again and confirm the backend
     // eventually stores the latest dirty bytes.
     assert!(backend.complete_next_deferred_bio(IoKind::Write, true));
     flush_thread.join();
     assert!(flush_result.lock().take().unwrap().is_ok());
+    assert_eq!(backend.outstanding_pages(), 1);
 
     backend.set_completion(IoKind::Write, IoCompletion::Immediate);
     page_cache.read().flush_range(0..PAGE_SIZE).unwrap();
@@ -180,6 +821,53 @@ fn concurrent_write_and_flush() {
     assert_eq!(read_buffer, latest_dirty_pattern);
     assert_eq!(backend.write_count(0), 2);
     assert_eq!(backend.persisted_page_bytes(0), latest_dirty_pattern);
+    assert_eq!(backend.outstanding_pages(), 0);
+}
+
+/// A truncate that removes a page while failed writeback is in flight must
+/// release that page's outstanding budget after the failure redirties it.
+#[ktest]
+fn truncate_discards_failed_inflight_writeback_accounting() {
+    let backend = MockPageCacheBackend::new(1);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+
+    let page_cache = new_locked_backend_page_cache(&backend, 1);
+    let vmo = page_cache.read().as_vmo().clone();
+    page_cache.write().write_bytes(0, &[0x5a]).unwrap();
+    assert_eq!(backend.outstanding_pages(), 1);
+
+    let flush_result = Arc::new(Mutex::new(None::<Result<()>>));
+    let flush_thread = {
+        let vmo = vmo.clone();
+        let flush_result = flush_result.clone();
+        ThreadOptions::new(move || {
+            *flush_result.lock() = Some(
+                vmo.as_backed_vmo()
+                    .unwrap()
+                    .flush_dirty_pages(&(0..PAGE_SIZE)),
+            );
+        })
+        .spawn()
+    };
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+
+    let resize_result = Arc::new(Mutex::new(None::<Result<()>>));
+    let resize_thread = {
+        let page_cache = page_cache.clone();
+        let resize_result = resize_result.clone();
+        ThreadOptions::new(move || {
+            *resize_result.lock() = Some(page_cache.write().resize(0, PAGE_SIZE));
+        })
+        .spawn()
+    };
+
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, false));
+    flush_thread.join();
+    resize_thread.join();
+
+    assert!(flush_result.lock().take().unwrap().is_err());
+    assert!(resize_result.lock().take().unwrap().is_ok());
+    assert_eq!(backend.outstanding_pages(), 0);
 }
 
 /// Re-dirties a page while another task runs `flush_range()` and
@@ -549,4 +1237,49 @@ fn delayed_io_completion() {
     assert!(first_flush_result.lock().take().unwrap().is_ok());
     assert!(second_flush_result.lock().take().unwrap().is_ok());
     assert_eq!(backend.persisted_page_bytes(0), latest_dirty_pattern);
+}
+
+/// A failed asynchronous write completion must leave the page dirty so a
+/// later flush can retry instead of silently losing the buffered update.
+#[ktest]
+fn failed_write_completion_redirties_page_for_retry() {
+    let backend = MockPageCacheBackend::new(1);
+    backend.set_completion(IoKind::Write, IoCompletion::Deferred);
+
+    let page_cache = new_locked_backend_page_cache(&backend, 1);
+    let dirty_pattern = vec![0x7d; PAGE_SIZE];
+    page_cache.write().write_bytes(0, &dirty_pattern).unwrap();
+
+    let first_flush_result = Arc::new(Mutex::new(None::<Result<()>>));
+    let flush_thread = {
+        let page_cache = page_cache.clone();
+        let first_flush_result = first_flush_result.clone();
+        ThreadOptions::new(move || {
+            *first_flush_result.lock() = Some(page_cache.read().flush_range(0..PAGE_SIZE));
+        })
+        .spawn()
+    };
+
+    backend.wait_for_deferred_bios(IoKind::Write, 1);
+    assert!(backend.complete_next_deferred_bio(IoKind::Write, false));
+    flush_thread.join();
+
+    assert_eq!(
+        first_flush_result
+            .lock()
+            .take()
+            .unwrap()
+            .unwrap_err()
+            .error(),
+        Errno::EIO
+    );
+    assert_eq!(
+        page_cache.read().dirty_ranges(0..PAGE_SIZE),
+        vec![0..PAGE_SIZE]
+    );
+
+    backend.set_completion(IoKind::Write, IoCompletion::Immediate);
+    page_cache.read().flush_range(0..PAGE_SIZE).unwrap();
+    assert_eq!(backend.write_count(0), 2);
+    assert_eq!(backend.persisted_page_bytes(0), dirty_pattern);
 }

@@ -3,7 +3,10 @@
 //! Test-only helpers for deterministic page-cache I/O scheduling.
 
 use alloc::{format, vec};
-use core::fmt;
+use core::{
+    fmt,
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+};
 
 use aster_block::{
     BlockDevice, BlockDeviceMeta, SECTOR_SIZE,
@@ -11,10 +14,19 @@ use aster_block::{
     id::Sid,
 };
 use device_id::DeviceId;
-use io_util::batch::IoBatch;
+use io_util::batch::{IoBatch, IoCompletion as BatchIoCompletion};
 use ostd::mm::VmIo;
 
-use crate::{prelude::*, thread::Thread, vm::page_cache::BlockAsPageCacheBackend};
+use crate::{
+    prelude::*,
+    thread::Thread,
+    vm::page_cache::{
+        BlockAsPageCacheBackend, CachePage, CachePageExt, LockedCachePage, PageCacheBackend,
+        PageCacheWritebackObserver, PreparedWritebackCompletion, WritebackCompletion,
+        WritebackCompletionDispatcher, WritebackPage, WritebackSequence,
+        submit_one_block_write_page,
+    },
+};
 
 /// Maximum number of cooperative yields before a test wait times out.
 const MAX_WAIT_YIELDS: usize = 1_000_000;
@@ -67,6 +79,8 @@ struct MockBackendState {
     write_completion: IoCompletion,
     deferred_reads: VecDeque<DeferredBio>,
     deferred_writes: VecDeque<DeferredBio>,
+    write_batch_sizes: Vec<usize>,
+    fail_write_batch_before_submission: bool,
 }
 
 impl MockBackendState {
@@ -81,6 +95,8 @@ impl MockBackendState {
             write_completion: IoCompletion::Immediate,
             deferred_reads: VecDeque::new(),
             deferred_writes: VecDeque::new(),
+            write_batch_sizes: Vec::new(),
+            fail_write_batch_before_submission: false,
         }
     }
 
@@ -143,6 +159,322 @@ impl MockBackendState {
 pub(super) struct MockPageCacheBackend {
     state: SpinLock<MockBackendState>,
     num_pages: usize,
+    observer: Arc<MockWritebackObserver>,
+}
+
+#[derive(Debug)]
+struct MockWritebackObserver {
+    outstanding_pages: AtomicUsize,
+    dispatcher: Option<Arc<MockWritebackDispatcher>>,
+}
+
+#[derive(Debug)]
+pub(super) struct MockWritebackDispatcher {
+    state: Mutex<MockWritebackDispatcherState>,
+    pause_before_prepare: AtomicBool,
+    prepare_entered: AtomicBool,
+}
+
+impl Default for MockWritebackDispatcher {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(MockWritebackDispatcherState::default()),
+            pause_before_prepare: AtomicBool::new(false),
+            prepare_entered: AtomicBool::new(false),
+        }
+    }
+}
+
+struct MockPreparedCompletion {
+    sequence: WritebackSequence,
+    completion: WritebackCompletion,
+    status: Arc<AtomicU32>,
+}
+
+#[derive(Default)]
+struct MockWritebackDispatcherState {
+    prepared: VecDeque<MockPreparedCompletion>,
+    next_sequence: u64,
+    completion_progress: u64,
+    fail_prepare: bool,
+    max_prepared: Option<usize>,
+    wait_count: usize,
+    errors: Vec<(WritebackSequence, Error)>,
+}
+
+impl Debug for MockWritebackDispatcherState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MockWritebackDispatcherState")
+            .field("prepared_count", &self.prepared.len())
+            .field("next_sequence", &self.next_sequence)
+            .finish()
+    }
+}
+
+impl MockWritebackDispatcher {
+    pub(super) fn finish_next(&self) -> Option<Result<()>> {
+        let prepared = self.state.lock().prepared.pop_front()?;
+        let result = {
+            let status = BioStatus::try_from(prepared.status.load(Ordering::Acquire))
+                .unwrap_or(BioStatus::IoError);
+            prepared.completion.finish(status)
+        };
+        if let Err(error) = result {
+            self.state.lock().errors.push((prepared.sequence, error));
+        }
+        self.state.lock().completion_progress += 1;
+        Some(result)
+    }
+
+    pub(super) fn prepared_count(&self) -> usize {
+        self.state.lock().prepared.len()
+    }
+
+    pub(super) fn set_fail_prepare(&self, fail: bool) {
+        self.state.lock().fail_prepare = fail;
+    }
+
+    pub(super) fn set_max_prepared(&self, max_prepared: usize) {
+        self.state.lock().max_prepared = Some(max_prepared);
+    }
+
+    pub(super) fn wait_count(&self) -> usize {
+        self.state.lock().wait_count
+    }
+
+    pub(super) fn pause_prepare(&self) {
+        self.prepare_entered.store(false, Ordering::Release);
+        self.pause_before_prepare.store(true, Ordering::Release);
+    }
+
+    pub(super) fn wait_until_prepare_entered(&self) {
+        while !self.prepare_entered.load(Ordering::Acquire) {
+            Thread::yield_now();
+        }
+    }
+
+    pub(super) fn resume_prepare(&self) {
+        self.pause_before_prepare.store(false, Ordering::Release);
+    }
+}
+
+impl WritebackCompletionDispatcher for MockWritebackDispatcher {
+    fn prepare(
+        &self,
+        completion: &mut Option<WritebackCompletion>,
+        _nr_pages: usize,
+    ) -> Result<PreparedWritebackCompletion> {
+        if self.pause_before_prepare.load(Ordering::Acquire) {
+            self.prepare_entered.store(true, Ordering::Release);
+            while self.pause_before_prepare.load(Ordering::Acquire) {
+                Thread::yield_now();
+            }
+        }
+        if self.state.lock().fail_prepare {
+            return_errno!(Errno::EIO);
+        }
+        {
+            let state = self.state.lock();
+            if state
+                .max_prepared
+                .is_some_and(|limit| state.prepared.len() >= limit)
+            {
+                return_errno!(Errno::EBUSY);
+            }
+        }
+        let status = Arc::new(AtomicU32::new(BioStatus::Init as u32));
+        let completion_status = status.clone();
+        let mut state = self.state.lock();
+        state.next_sequence += 1;
+        let sequence = WritebackSequence::new(state.next_sequence);
+        state.prepared.push_back(MockPreparedCompletion {
+            sequence,
+            completion: completion.take().unwrap(),
+            status,
+        });
+        Ok(PreparedWritebackCompletion {
+            complete_fn: Box::new(move |status| {
+                completion_status.store(status as u32, Ordering::Release);
+            }),
+            sequence,
+        })
+    }
+
+    fn finish_submission_failure(&self, sequence: WritebackSequence, _error: Error) {
+        let mut state = self.state.lock();
+        let index = state
+            .prepared
+            .iter()
+            .position(|prepared| prepared.sequence == sequence)
+            .expect("submission failure must match a prepared completion");
+        let prepared = state.prepared.remove(index).unwrap();
+        drop(state);
+        assert!(prepared.completion.finish(BioStatus::IoError).is_err());
+        self.state.lock().completion_progress += 1;
+    }
+
+    fn completion_progress(&self) -> u64 {
+        self.state.lock().completion_progress
+    }
+
+    fn wait_for_completion_progress_since(&self, observed: u64) {
+        if self.state.lock().completion_progress != observed {
+            return;
+        }
+        let Some(sequence) = self.latest_sequence() else {
+            return;
+        };
+        let _ = self.wait_through(sequence);
+    }
+
+    fn latest_sequence(&self) -> Option<WritebackSequence> {
+        let sequence = self.state.lock().next_sequence;
+        (sequence != 0).then(|| WritebackSequence::new(sequence))
+    }
+
+    fn wait_through(&self, sequence: WritebackSequence) -> Result<()> {
+        self.state.lock().wait_count += 1;
+        let mut first_error = self
+            .state
+            .lock()
+            .errors
+            .iter()
+            .find(|(error_sequence, _)| *error_sequence <= sequence)
+            .map(|(_, error)| *error);
+        loop {
+            let ready = {
+                let state = self.state.lock();
+                let Some(index) = state
+                    .prepared
+                    .iter()
+                    .position(|prepared| prepared.sequence <= sequence)
+                else {
+                    return match first_error {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    };
+                };
+                (state.prepared[index].status.load(Ordering::Acquire) != BioStatus::Init as u32)
+                    .then_some(index)
+            };
+            let Some(index) = ready else {
+                Thread::yield_now();
+                continue;
+            };
+            let prepared = self.state.lock().prepared.remove(index).unwrap();
+            let status = BioStatus::try_from(prepared.status.load(Ordering::Acquire))
+                .unwrap_or(BioStatus::IoError);
+            if let Err(error) = prepared.completion.finish(status) {
+                self.state.lock().errors.push((prepared.sequence, error));
+                first_error.get_or_insert(error);
+            }
+            self.state.lock().completion_progress += 1;
+        }
+    }
+
+    fn consume_error_through(&self, sequence: WritebackSequence) -> Option<Error> {
+        let mut state = self.state.lock();
+        let first_error = state
+            .errors
+            .iter()
+            .find(|(error_sequence, _)| *error_sequence <= sequence)
+            .map(|(_, error)| *error);
+        state
+            .errors
+            .retain(|(error_sequence, _)| *error_sequence > sequence);
+        first_error
+    }
+}
+
+impl PageCacheWritebackObserver for MockWritebackObserver {
+    fn page_dirtied(&self, _page_idx: usize) {
+        self.outstanding_pages.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn page_cleaned(&self, _page_idx: usize) {
+        let previous = self.outstanding_pages.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
+
+    fn writeback_completion_dispatcher(&self) -> Option<Arc<dyn WritebackCompletionDispatcher>> {
+        self.dispatcher
+            .as_ref()
+            .map(|dispatcher| dispatcher.clone() as Arc<dyn WritebackCompletionDispatcher>)
+    }
+}
+
+/// A direct backend whose observer has a dispatcher, but whose write path does
+/// not opt into detached completion ownership.
+#[derive(Debug)]
+pub(super) struct MockDirectPageCacheBackend {
+    observer: Arc<MockWritebackObserver>,
+    write_submitted: Arc<AtomicBool>,
+    write_completed: Arc<AtomicBool>,
+}
+
+impl MockDirectPageCacheBackend {
+    pub(super) fn new() -> Self {
+        Self {
+            observer: Arc::new(MockWritebackObserver {
+                outstanding_pages: AtomicUsize::new(0),
+                dispatcher: Some(Arc::new(MockWritebackDispatcher::default())),
+            }),
+            write_submitted: Arc::new(AtomicBool::new(false)),
+            write_completed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(super) fn wait_for_write_submission(&self) {
+        wait_until(|| self.write_submitted.load(Ordering::Acquire));
+    }
+
+    pub(super) fn complete_write(&self) {
+        self.write_completed.store(true, Ordering::Release);
+    }
+}
+
+struct MockDirectWriteCompletion {
+    page: CachePage,
+    completed: Arc<AtomicBool>,
+}
+
+impl BatchIoCompletion for MockDirectWriteCompletion {
+    fn wait(&self) -> core::result::Result<(), io_util::IoError> {
+        wait_until(|| self.completed.load(Ordering::Acquire));
+        self.page.clone().lock().clear_writing_back();
+        Ok(())
+    }
+}
+
+impl PageCacheBackend for MockDirectPageCacheBackend {
+    fn writeback_observer(&self) -> Option<Arc<dyn PageCacheWritebackObserver>> {
+        Some(self.observer.clone())
+    }
+
+    fn read_page_async(
+        &self,
+        _idx: usize,
+        _locked_page: LockedCachePage,
+        _io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        unreachable!("dispatcher opt-in test does not submit I/O")
+    }
+
+    fn write_page_async(
+        &self,
+        _idx: usize,
+        locked_page: LockedCachePage,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        locked_page.set_writing_back();
+        locked_page.set_up_to_date();
+        io_batch.push(Arc::new(MockDirectWriteCompletion {
+            page: locked_page.unlock(),
+            completed: self.write_completed.clone(),
+        }));
+        self.write_submitted.store(true, Ordering::Release);
+        Ok(())
+    }
 }
 
 impl MockPageCacheBackend {
@@ -151,7 +483,26 @@ impl MockPageCacheBackend {
         Arc::new(Self {
             state: SpinLock::new(MockBackendState::new(num_pages)),
             num_pages,
+            observer: Arc::new(MockWritebackObserver {
+                outstanding_pages: AtomicUsize::new(0),
+                dispatcher: None,
+            }),
         })
+    }
+
+    pub(super) fn new_with_detached_writeback(
+        num_pages: usize,
+    ) -> (Arc<Self>, Arc<MockWritebackDispatcher>) {
+        let dispatcher = Arc::new(MockWritebackDispatcher::default());
+        let backend = Arc::new(Self {
+            state: SpinLock::new(MockBackendState::new(num_pages)),
+            num_pages,
+            observer: Arc::new(MockWritebackObserver {
+                outstanding_pages: AtomicUsize::new(0),
+                dispatcher: Some(dispatcher.clone()),
+            }),
+        });
+        (backend, dispatcher)
     }
 
     /// Sets how future BIOs of `kind` complete.
@@ -191,6 +542,28 @@ impl MockPageCacheBackend {
     /// Returns how many write BIOs were submitted for `page_idx`.
     pub(super) fn write_count(&self, page_idx: usize) -> usize {
         self.state.lock().submission_count(IoKind::Write, page_idx)
+    }
+
+    /// Returns the page counts delivered through each batched write call.
+    pub(super) fn write_batch_sizes(&self) -> Vec<usize> {
+        self.state.lock().write_batch_sizes.clone()
+    }
+
+    pub(super) fn outstanding_pages(&self) -> usize {
+        self.observer.outstanding_pages.load(Ordering::Acquire)
+    }
+
+    pub(super) fn set_fail_write_batch_before_submission(&self, fail: bool) {
+        self.state.lock().fail_write_batch_before_submission = fail;
+    }
+
+    pub(super) fn set_write_submit_failure(&self, page_idx: usize, fail: bool) {
+        let mut state = self.state.lock();
+        if fail {
+            state.write_submit_failures.insert(page_idx);
+        } else {
+            state.write_submit_failures.remove(&page_idx);
+        }
     }
 
     /// Returns the bytes currently persisted for `page_idx`.
@@ -329,6 +702,10 @@ impl BlockDevice for MockPageCacheBackend {
 }
 
 impl BlockAsPageCacheBackend for MockPageCacheBackend {
+    fn writeback_observer(&self) -> Option<Arc<dyn PageCacheWritebackObserver>> {
+        Some(self.observer.clone())
+    }
+
     fn submit_read_bio(
         &self,
         page_idx: usize,
@@ -353,5 +730,19 @@ impl BlockAsPageCacheBackend for MockPageCacheBackend {
             return_errno!(Errno::EINVAL);
         }
         self.submit_bio(IoKind::Write, page_idx, bio_segment, complete_fn, io_batch)
+    }
+
+    fn submit_write_pages(&self, pages: Vec<WritebackPage>, io_batch: &mut IoBatch) -> Result<()> {
+        {
+            let mut state = self.state.lock();
+            if state.fail_write_batch_before_submission {
+                return_errno!(Errno::EIO);
+            }
+            state.write_batch_sizes.push(pages.len());
+        }
+        for page in pages {
+            submit_one_block_write_page(self, page, io_batch)?;
+        }
+        Ok(())
     }
 }

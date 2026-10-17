@@ -227,7 +227,7 @@ impl From<aster_block::bio::BioEnqueueError> for Error {
                 Error::with_message(Errno::EBUSY, "The request queue is full")
             }
             aster_block::bio::BioEnqueueError::Refused => {
-                Error::with_message(Errno::EBUSY, "Refuse to enqueue the bio")
+                Error::with_message(Errno::EIO, "Refuse to enqueue the bio")
             }
             aster_block::bio::BioEnqueueError::TooBig => {
                 Error::with_message(Errno::EINVAL, "Bio is too big")
@@ -394,3 +394,18 @@ macro_rules! return_errno_with_message {
 }
 
 pub(crate) use return_errno_with_message;
+
+#[cfg(ktest)]
+mod tests {
+    use aster_block::bio::BioEnqueueError;
+    use ostd::prelude::ktest;
+
+    use super::{Errno, Error};
+
+    #[ktest]
+    fn bio_enqueue_errors_preserve_retryability() {
+        assert_eq!(Error::from(BioEnqueueError::IsFull).error(), Errno::EBUSY);
+        assert_eq!(Error::from(BioEnqueueError::Refused).error(), Errno::EIO);
+        assert_eq!(Error::from(BioEnqueueError::TooBig).error(), Errno::EINVAL);
+    }
+}

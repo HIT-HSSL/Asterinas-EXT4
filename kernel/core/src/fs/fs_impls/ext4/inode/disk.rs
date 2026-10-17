@@ -414,43 +414,24 @@ pub(in super::super) struct RawInode {
 }
 
 impl RawInode {
-    /// Reads the on-disk inode slot at `offset`, honoring the volume's
-    /// `inode_size`.
-    ///
-    /// Exactly `inode_size` bytes are read from the device; on a
-    /// 128-byte-inode volume the missing tail of the returned 256-byte
-    /// `RawInode` is zero-filled, so the extra fields (`extra_isize`,
-    /// sub-second timestamps, `crtime`) decode to their absent defaults
-    /// without any decoding branch.
-    pub(in super::super) fn read_from_slot(
-        device: &Arc<dyn BlockDevice>,
-        offset: usize,
-        inode_size: usize,
-    ) -> Result<Self> {
+    /// Decodes one inode slot, zero-filling fields absent from short slots.
+    pub(in super::super) fn decode_slot(slot: &[u8], inode_size: usize) -> Result<Self> {
         let mut bytes = [0u8; size_of::<Self>()];
         let n = inode_size.min(size_of::<Self>());
-        device
-            .read_bytes(offset, &mut bytes[..n])
-            .map_err(|_| Error::with_message(Errno::EIO, "failed to read inode slot"))?;
+        let source = slot
+            .get(..n)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "inode slot is truncated"))?;
+        bytes[..n].copy_from_slice(source);
         Ok(Self::from_bytes(&bytes))
     }
 
-    /// Writes this inode back to its slot at `offset`, honoring the volume's
-    /// `inode_size`.
-    ///
-    /// Only the first `inode_size` bytes are written, so on a 128-byte-inode
-    /// volume the bytes past the slot (the next inode's storage) are never
-    /// touched.
-    pub(in super::super) fn write_to_slot(
-        &self,
-        device: &Arc<dyn BlockDevice>,
-        offset: usize,
-        inode_size: usize,
-    ) -> Result<()> {
+    /// Encodes this inode into one slot without touching neighboring bytes.
+    pub(in super::super) fn encode_slot(&self, slot: &mut [u8], inode_size: usize) -> Result<()> {
         let n = inode_size.min(size_of::<Self>());
-        device
-            .write_bytes(offset, &self.as_bytes()[..n])
-            .map_err(|_| Error::with_message(Errno::EIO, "failed to write inode slot"))?;
+        let destination = slot
+            .get_mut(..n)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "inode slot is truncated"))?;
+        destination.copy_from_slice(&self.as_bytes()[..n]);
         Ok(())
     }
 
@@ -586,3 +567,5 @@ impl Default for InodeTail {
         Self([0u8; 96])
     }
 }
+
+impl crate::fs::fs_impls::ext4::nv::persistent::Sealed for RawInode {}

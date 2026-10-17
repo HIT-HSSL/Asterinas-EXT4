@@ -65,6 +65,8 @@ bitflags! {
         const ENCRYPT = 1 << 16;
         /// `INCOMPAT_CASEFOLD`.
         const CASEFOLD = 1 << 17;
+        /// Experimental unified SSD/NVPool extent addresses.
+        const NV_TIER = 1 << 31;
     }
 }
 
@@ -105,8 +107,9 @@ bitflags! {
 ///
 /// Typed directory entries and extent block mapping are supported. A volume
 /// requiring any other incompatible feature is rejected.
-pub(super) const INCOMPAT_SUPP: FeatureIncompatSet =
-    FeatureIncompatSet::FILETYPE.union(FeatureIncompatSet::EXTENTS);
+pub(super) const INCOMPAT_SUPP: FeatureIncompatSet = FeatureIncompatSet::FILETYPE
+    .union(FeatureIncompatSet::EXTENTS)
+    .union(FeatureIncompatSet::NV_TIER);
 
 /// Read-only compatible features this implementation handles.
 ///
@@ -131,7 +134,14 @@ pub(super) const RO_COMPAT_SUPP: FeatureRoCompatSet = FeatureRoCompatSet::SPARSE
 /// An `ext2` mount only accepts true ext2-format volumes, mirroring Linux's
 /// `IS_EXT2_SB`: a volume with extent mapping or a journal is an ext3/ext4
 /// image and must be mounted as `ext4` instead.
-pub(super) fn check_flavor(sb: &SuperBlock, flavor: MountFlavor) -> Result<()> {
+pub(super) fn check_flavor(
+    sb: &SuperBlock,
+    flavor: MountFlavor,
+    nvpool_enabled: bool,
+) -> Result<()> {
+    if sb.feature_incompat().contains(FeatureIncompatSet::NV_TIER) && !nvpool_enabled {
+        return_errno_with_message!(Errno::EINVAL, "NV-tier volume requires nvpool mount option");
+    }
     match flavor {
         MountFlavor::Ext4 => Ok(()),
         MountFlavor::Ext2 => {

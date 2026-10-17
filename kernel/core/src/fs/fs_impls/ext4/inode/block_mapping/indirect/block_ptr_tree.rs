@@ -13,6 +13,7 @@ use super::{
     IndirectBid,
     indirect_block::{IndirectBlock, IndirectBlockManager},
 };
+use crate::fs::fs_impls::ext4::writeback::Ext4PageWritebackObserver;
 
 const PTRS_PER_BLOCK: usize = BLOCK_SIZE / size_of::<u32>();
 const SECTORS_PER_BLOCK: u32 = (BLOCK_SIZE / SECTOR_SIZE) as u32;
@@ -38,15 +39,35 @@ const MAX_BLOCK_POINTER_LEVELS: usize = 4;
 pub(super) struct BlockPtrTree {
     raw_block_ptrs: Dirty<RawBlockPtrs>,
     indirect_blocks_manager: Mutex<IndirectBlockManager>,
+    writeback_observer: Arc<Ext4PageWritebackObserver>,
 }
 
 impl BlockPtrTree {
     /// Creates a new block-pointer tree from the on-disk raw pointers.
-    pub(super) fn new(raw_block_ptrs: RawBlockPtrs, fs: Weak<Ext4>) -> Self {
+    pub(super) fn new(
+        raw_block_ptrs: RawBlockPtrs,
+        fs: Weak<Ext4>,
+        writeback_observer: Arc<Ext4PageWritebackObserver>,
+    ) -> Self {
         Self {
             raw_block_ptrs: Dirty::new(raw_block_ptrs),
             indirect_blocks_manager: Mutex::new(IndirectBlockManager::new(fs)),
+            writeback_observer,
         }
+    }
+
+    fn alloc_blocks(&self, fs: &Ext4, count: u32, goal: Ext4Bid) -> Result<Range<Ext4Bid>> {
+        let range = fs.alloc_blocks(count, goal)?;
+        self.writeback_observer
+            .touch_metadata_range(fs, range.clone());
+        Ok(range)
+    }
+
+    fn free_blocks(&self, fs: &Ext4, start: Ext4Bid, count: u32) -> Result<()> {
+        fs.free_blocks(start, count)?;
+        self.writeback_observer
+            .touch_released_metadata_range(fs, start..start + Ext4Bid::from(count));
+        Ok(())
     }
 
     /// Returns a reference to the raw on-disk block pointer state.
@@ -247,7 +268,7 @@ impl BlockPtrTree {
             if bid == 0 {
                 continue;
             }
-            fs.free_blocks(Ext4Bid::from(bid), 1)?;
+            self.free_blocks(fs, Ext4Bid::from(bid), 1)?;
             self.raw_block_ptrs.block_ptrs[idx] = 0;
             self.raw_block_ptrs.sector_count = self
                 .raw_block_ptrs
@@ -582,7 +603,7 @@ impl BlockPtrTree {
         }
 
         if indirect_levels == 0 {
-            if let Err(err) = fs.free_blocks(Ext4Bid::from(block_bid), 1) {
+            if let Err(err) = self.free_blocks(fs, Ext4Bid::from(block_bid), 1) {
                 // Best-effort free path logs errors and proceeds.
                 error!(
                     "free_block_subtree: failed to free data block {}: {:?}",
@@ -620,7 +641,7 @@ impl BlockPtrTree {
             self.free_block_subtree(fs, bid, indirect_levels - 1);
         }
 
-        if let Err(err) = fs.free_blocks(Ext4Bid::from(block_bid), 1) {
+        if let Err(err) = self.free_blocks(fs, Ext4Bid::from(block_bid), 1) {
             error!(
                 "free_block_subtree: failed to free indirect block {}: {:?}",
                 block_bid, err
@@ -654,13 +675,15 @@ impl BlockPtrTree {
 
         // Allocate the missing indirect metadata first, then place data blocks
         // immediately after the metadata run when possible.
-        let mut guard = BlockAllocGuard::new(fs, indirect_blks);
+        let mut guard = BlockAllocGuard::new(fs, indirect_blks, self.writeback_observer.clone());
 
         let mut remaining_indirect_blks = indirect_blks;
         while remaining_indirect_blks > 0 {
-            let allocated = narrow_block_range(
-                fs.alloc_blocks(remaining_indirect_blks, Ext4Bid::from(alloc_goal))?,
-            )?;
+            let allocated = narrow_block_range(self.alloc_blocks(
+                fs,
+                remaining_indirect_blks,
+                Ext4Bid::from(alloc_goal),
+            )?)?;
             debug_assert!(allocated.end >= allocated.start);
             let allocated_count = allocated.end - allocated.start;
             debug_assert!(allocated_count > 0 && allocated_count <= remaining_indirect_blks);
@@ -671,7 +694,7 @@ impl BlockPtrTree {
         }
 
         let data_blocks_range =
-            narrow_block_range(fs.alloc_blocks(data_blks, Ext4Bid::from(alloc_goal))?)?;
+            narrow_block_range(self.alloc_blocks(fs, data_blks, Ext4Bid::from(alloc_goal))?)?;
         debug_assert!(data_blocks_range.end >= data_blocks_range.start);
         let allocated_count = data_blocks_range.end - data_blocks_range.start;
         guard.track_data_blocks(data_blocks_range.clone());
@@ -1117,15 +1140,21 @@ struct BlockAllocGuard<'a> {
     indirect_blocks: Vec<IndirectBid>,
     data_blocks: Range<IndirectBid>,
     committed: bool,
+    writeback_observer: Arc<Ext4PageWritebackObserver>,
 }
 
 impl<'a> BlockAllocGuard<'a> {
-    fn new(fs: &'a Ext4, indirect_blocks: u32) -> Self {
+    fn new(
+        fs: &'a Ext4,
+        indirect_blocks: u32,
+        writeback_observer: Arc<Ext4PageWritebackObserver>,
+    ) -> Self {
         Self {
             fs,
             indirect_blocks: Vec::with_capacity(indirect_blocks as usize),
             data_blocks: Range { start: 0, end: 0 },
             committed: false,
+            writeback_observer,
         }
     }
 
@@ -1155,6 +1184,11 @@ impl Drop for BlockAllocGuard<'_> {
                     "failed to free indirect block {} in rollback: {:?}",
                     bid, err
                 );
+            } else {
+                self.writeback_observer.touch_released_metadata_range(
+                    self.fs,
+                    Ext4Bid::from(bid)..Ext4Bid::from(bid) + 1,
+                );
             }
         }
 
@@ -1167,6 +1201,11 @@ impl Drop for BlockAllocGuard<'_> {
         );
         if let Err(err) = free_result {
             error!("failed to free data blocks in rollback: {:?}", err);
+        } else {
+            self.writeback_observer.touch_released_metadata_range(
+                self.fs,
+                Ext4Bid::from(self.data_blocks.start)..Ext4Bid::from(self.data_blocks.end),
+            );
         }
     }
 }
@@ -1220,9 +1259,11 @@ mod test {
         sector_count: u32,
         fs: &Arc<Ext4>,
     ) -> BlockPtrTree {
+        let observer = Ext4PageWritebackObserver::new(Arc::downgrade(fs), 1);
         BlockPtrTree::new(
             RawBlockPtrs::new(sector_count, block_ptrs),
             Arc::downgrade(fs),
+            observer,
         )
     }
 

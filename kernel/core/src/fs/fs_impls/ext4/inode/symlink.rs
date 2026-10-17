@@ -74,7 +74,7 @@ impl Inode {
         }
         let fs = self.fs()?;
         let mut inner = self.inner.write();
-        inner.write_link(&fs, target)?;
+        inner.write_link(self.ino, &fs, self.self_ref.clone(), target)?;
         inner.set_mtime_ctime(utils::now());
         Ok(())
     }
@@ -110,15 +110,21 @@ impl InodeInner {
         matches!(self.payload, InodePayload::FastSymlink { .. })
     }
 
-    fn write_link(&mut self, fs: &Arc<Ext4>, target: &str) -> Result<()> {
+    fn write_link(
+        &mut self,
+        ino: Ext4Ino,
+        fs: &Arc<Ext4>,
+        inode: Weak<Inode>,
+        target: &str,
+    ) -> Result<()> {
         let target_len = target.len();
 
         // Reserve one byte in `i_block` for a trailing NUL.
         if target_len < MAX_FAST_SYMLINK_LEN {
             // Fast path: store the target inline in the `i_block` area. Free any
             // data block held by a previous slow target first.
-            if let InodePayload::DataBacked { block_manager, .. } = &self.payload {
-                block_manager.truncate_to_byte_len(0)?;
+            if matches!(self.payload, InodePayload::DataBacked { .. }) {
+                self.shrink(0)?;
             }
             let mut fast_target = FastSymlinkTarget::new_zeros();
             fast_target.write(target.as_bytes());
@@ -149,10 +155,12 @@ impl InodeInner {
                     .feature_incompat()
                     .contains(FeatureIncompatSet::EXTENTS);
                 self.payload = InodePayload::new_data_backed_empty(
+                    ino,
                     Arc::downgrade(fs),
                     extent_based,
                     self.file_size(),
                 )?;
+                self.block_manager()?.bind_writeback_target(inode);
                 if extent_based {
                     self.desc.add_flags(FileFlags::EXTENTS);
                 }
@@ -231,12 +239,19 @@ mod tests {
         // A long target forces the fast-to-slow switch.
         let long_target = "x".repeat(MAX_FAST_SYMLINK_LEN + 10);
         link.write_link(&long_target).unwrap();
+        assert_eq!(f.ext4.writeback_controller().outstanding_pages(), 1);
         assert_eq!(link.read_link().unwrap(), long_target);
         assert!(!link.inner.read().desc.flags().contains(FileFlags::EXTENTS));
 
         // The flag stays clear on disk too.
         link.sync_data().unwrap();
+        assert_eq!(f.ext4.writeback_controller().outstanding_pages(), 0);
         let raw = f.read_raw_inode(link.ino());
         assert_eq!(raw.flags & 0x0008_0000, 0); // EXTENTS_FL
+
+        link.write_link(&long_target).unwrap();
+        assert_eq!(f.ext4.writeback_controller().outstanding_pages(), 1);
+        link.write_link("short").unwrap();
+        assert_eq!(f.ext4.writeback_controller().outstanding_pages(), 0);
     }
 }

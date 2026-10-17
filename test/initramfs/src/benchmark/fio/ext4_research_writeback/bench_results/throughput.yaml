@@ -1,0 +1,15 @@
+alert:
+  bigger_is_better: true
+  threshold: 125%
+chart:
+  description: fio 4KB buffered random-write bandwidth with fsync every 32 writes
+  legend: Random-write bandwidth on {system}
+  title: '[EXT4 research] 4KB random write bandwidth'
+  unit: KiB/s
+result_extraction:
+  result_index: 2
+  search_pattern: 'WRITE: bw='
+runtime_config:
+  aster_scheme: null
+  mem: 4G
+  smp: 2

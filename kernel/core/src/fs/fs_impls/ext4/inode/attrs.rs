@@ -200,8 +200,13 @@ impl Inode {
         let xattr = self.xattr.as_ref().ok_or_else(|| {
             Error::with_message(Errno::EPERM, "xattr not supported on this inode type")
         })?;
+        let old_bid = xattr.bid();
         xattr.set_xattr(name, value_reader, flags)?;
         let new_bid = xattr.bid();
+        if old_bid == 0 && new_bid != 0 {
+            let fs = self.fs()?;
+            self.touch_metadata_range(&fs, new_bid..new_bid + 1);
+        }
 
         let mut inner = self.inner.write();
         inner.set_file_acl(new_bid);
@@ -214,8 +219,13 @@ impl Inode {
         let xattr = self.xattr.as_ref().ok_or_else(|| {
             Error::with_message(Errno::EPERM, "xattr not supported on this inode type")
         })?;
+        let old_bid = xattr.bid();
         xattr.remove_xattr(name)?;
         let new_bid = xattr.bid();
+        if old_bid != 0 && new_bid == 0 {
+            let fs = self.fs()?;
+            self.touch_released_metadata_range(&fs, old_bid..old_bid + 1);
+        }
 
         let mut inner = self.inner.write();
         inner.set_file_acl(new_bid);

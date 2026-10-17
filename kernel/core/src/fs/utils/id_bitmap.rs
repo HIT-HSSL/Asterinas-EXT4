@@ -44,7 +44,6 @@ impl IdBitmap {
     }
 
     /// Returns the length of the ID bitmap, i.e., the maximum number of IDs.
-    #[expect(unused)]
     pub(crate) const fn len(&self) -> u16 {
         self.len
     }
@@ -142,6 +141,27 @@ impl IdBitmap {
         }
 
         Some(allocated_range)
+    }
+
+    /// Allocates exactly `range` when every ID in it is currently free.
+    ///
+    /// Returns `false` without changing the bitmap if the range is empty, out
+    /// of bounds, or contains an allocated ID.
+    pub(crate) fn alloc_exact(&mut self, range: Range<u16>) -> bool {
+        if range.is_empty() || range.end > self.len {
+            return false;
+        }
+        if range.clone().any(|id| self.is_allocated(id)) {
+            return false;
+        }
+
+        for id in range.clone() {
+            self.bit_slice_mut().set(usize::from(id), true);
+        }
+        if range.contains(&self.first_available_id) {
+            self.update_first_available_id(range.end);
+        }
+        true
     }
 
     /// Releases the allocated `id`.

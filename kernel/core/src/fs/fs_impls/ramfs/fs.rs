@@ -151,10 +151,12 @@ pub(in crate::fs::fs_impls) struct RamInode {
     /// Reference to fs
     fs: Weak<RamFs>,
     /// Device ID.
+    ///
     /// Detached inodes such as `memfd` store it directly
     /// because they do not have a valid fs reference.
     container_dev_id: DeviceId,
     /// Hard linkability.
+    ///
     /// All inodes except temporary files are set to linkable
     /// Linkability of temporary files is specified via [`RamInode::create_tmpfile`]
     hard_linkability: HardLinkability,
@@ -781,15 +783,22 @@ impl RamInode {
             return_errno_with_message!(Errno::ENOTDIR, "self is not dir");
         }
 
+        self.unlink_impl(name, predicate)
+    }
+
+    fn unlink_impl<F>(&self, name: &str, predicate: F) -> Result<bool>
+    where
+        F: FnOnce(&Self) -> bool,
+    {
+        // When we got the lock, the directory may have been modified by another thread.
         let mut self_dir = self.inner.as_direntry().unwrap().write();
         let (idx, target) = self_dir.get_entry(name).ok_or(Error::new(Errno::ENOENT))?;
-        if !predicate(&target) {
-            return Ok(false);
-        }
         if target.typ == InodeType::Dir {
             return_errno_with_message!(Errno::EISDIR, "unlink on dir");
         }
-
+        if !predicate(&target) {
+            return Ok(false);
+        }
         self_dir.remove_entry(idx);
         drop(self_dir);
 
@@ -829,10 +838,18 @@ impl RamInode {
         }
 
         let target = self.find(name)?;
+        self.rmdir_impl(name, &target, predicate)
+    }
+
+    fn rmdir_impl<F>(&self, name: &str, target: &Self, predicate: F) -> Result<bool>
+    where
+        F: FnOnce(&Self) -> bool,
+    {
         if target.typ != InodeType::Dir {
             return_errno_with_message!(Errno::ENOTDIR, "rmdir on not dir");
         }
 
+        // When we got the lock, the directory may have been modified by another thread.
         let (mut self_dir, target_dir) = write_lock_two_direntries_by_ino(
             (self.ino, self.inner.as_direntry().unwrap()),
             (target.ino, target.inner.as_direntry().unwrap()),
@@ -843,10 +860,10 @@ impl RamInode {
         let Some((idx, current)) = self_dir.get_entry(name) else {
             return_errno!(Errno::ENOENT);
         };
-        if !Arc::ptr_eq(&current, &target) {
+        if !core::ptr::eq(&*current, target) {
             return_errno!(Errno::ENOENT);
         }
-        if !predicate(&target) {
+        if !predicate(target) {
             return Ok(false);
         }
         self_dir.remove_entry(idx);
@@ -893,9 +910,7 @@ impl RamInode {
             InodeType::SymLink => RamInode::new_symlink(&fs, mode, uid, gid, to_be_revalidated),
             InodeType::Socket => RamInode::new_socket(&fs, mode, uid, gid, to_be_revalidated),
             InodeType::Dir => RamInode::new_dir(&fs, mode, uid, gid, &self.this, to_be_revalidated),
-            _ => {
-                panic!("unsupported inode type");
-            }
+            _ => panic!("unsupported inode type"),
         };
 
         let mut self_dir = self_dir.upgrade();
@@ -1228,13 +1243,17 @@ impl Inode for RamInode {
         Ok(())
     }
 
-    fn unlink(&self, name: &str) -> Result<()> {
-        self.unlink_if(name, |_| true)?;
+    fn unlink(&self, name: &str, child: &Arc<dyn Inode>) -> Result<()> {
+        let target = child.downcast_ref::<RamInode>().unwrap();
+        if !self.unlink_impl(name, |entry| entry.ino == target.ino)? {
+            return_errno!(Errno::ENOENT);
+        }
         Ok(())
     }
 
-    fn rmdir(&self, name: &str) -> Result<()> {
-        self.rmdir_if(name, |_| true)?;
+    fn rmdir(&self, name: &str, child: &Arc<dyn Inode>) -> Result<()> {
+        let target = child.downcast_ref::<RamInode>().unwrap();
+        self.rmdir_impl(name, target, |_| true)?;
         Ok(())
     }
 

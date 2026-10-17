@@ -12,17 +12,17 @@ macro_rules! __log_prefix {
     };
 }
 
-use alloc::{
-    borrow::Cow,
-    io::{self, Cursor, Read},
-};
+use alloc::io::{self, Cursor, Read};
 
 use cpio_decoder::{CpioDecoder, CpioEntry, FileMetadata, FileType};
 use device_id::{DeviceId, MajorId, MinorId};
 use lending_iterator::LendingIterator;
+use miniz_oxide::{
+    DataFormat, MZFlush, MZStatus,
+    inflate::stream::{InflateState, inflate},
+};
 use ostd::boot::boot_info;
 use spin::once::Once;
-use zune_inflate::DeflateDecoder;
 
 use super::{
     file::{InodeMode, InodeType, mkmod},
@@ -45,31 +45,38 @@ pub(crate) fn init_in_first_kthread(path_resolver: &PathResolver) -> Result<()> 
         return Ok(());
     };
 
-    let (reader, suffix) = match &initramfs_buf[..4] {
+    match &initramfs_buf[..4] {
         // Gzip magic number: 0x1F 0x8B
         &[0x1F, 0x8B, _, _] => {
-            let decompressed = DeflateDecoder::new(initramfs_buf)
-                .decode_gzip()
-                .map_err(|_| Error::with_message(Errno::EINVAL, "gzip decompression failed"))?;
-            (Cow::Owned(decompressed), ".gz")
+            println!("[kernel] unpacking initramfs.cpio.gz to rootfs ...");
+            unpack_to_rootfs(
+                CpioDecoder::new(GzipReader::new(initramfs_buf)),
+                path_resolver,
+            )?;
         }
-        _ => (Cow::Borrowed(initramfs_buf), ""),
+        _ => {
+            println!("[kernel] unpacking initramfs.cpio to rootfs ...");
+            unpack_to_rootfs(CpioDecoder::new(Cursor::new(initramfs_buf)), path_resolver)?;
+        }
     };
 
-    println!("[kernel] unpacking initramfs.cpio{} to rootfs ...", suffix);
+    ensure_dev_console(path_resolver)?;
 
-    let mut decoder = CpioDecoder::new(Cursor::new(reader));
+    println!("[kernel] initramfs is ready");
+    Ok(())
+}
 
+/// Unpacks every entry of a CPIO archive into the rootfs.
+fn unpack_to_rootfs<R: Read>(
+    mut decoder: CpioDecoder<R>,
+    path_resolver: &PathResolver,
+) -> Result<()> {
     while let Some(entry_result) = decoder.next() {
         let mut entry = entry_result?;
         if let Err(e) = try_append_entry_to_rootfs(&mut entry, path_resolver) {
             warn!("failed to add entry {} to rootfs: {:?}", entry.name(), e);
         }
     }
-
-    ensure_dev_console(path_resolver)?;
-
-    println!("[kernel] initramfs is ready");
     Ok(())
 }
 
@@ -86,7 +93,7 @@ fn ensure_dev_console(path_resolver: &PathResolver) -> Result<()> {
             dev_path.mknod(
                 "console",
                 mkmod!(u+rw),
-                MknodType::CharDevice(tty::console_device_id().as_encoded_u64()),
+                MknodType::CharDevice(tty::CONSOLE_DEVICE_ID.as_encoded_u64()),
             )?;
             Ok(())
         }
@@ -173,6 +180,92 @@ fn try_append_entry_to_rootfs<R: Read>(
     }
 
     Ok(())
+}
+
+/// A streaming gzip decompressor over an in-memory compressed buffer.
+struct GzipReader<'a> {
+    // The DEFLATE body not yet consumed, shrinking as it is read.
+    deflate_body: &'a [u8],
+    state: Box<InflateState>,
+    done: bool,
+}
+
+impl<'a> GzipReader<'a> {
+    /// Creates a decompressor, parsing and skipping the gzip header of `buf`.
+    fn new(buf: &'a [u8]) -> Self {
+        Self {
+            deflate_body: strip_gzip_header(buf),
+            state: InflateState::new_boxed(DataFormat::Raw),
+            done: false,
+        }
+    }
+}
+
+impl Read for GzipReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+
+        while !self.done {
+            let result = inflate(&mut self.state, self.deflate_body, out, MZFlush::None);
+            self.deflate_body = &self.deflate_body[result.bytes_consumed..];
+            match result.status {
+                Ok(MZStatus::StreamEnd) => self.done = true,
+                Ok(_) => {}
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "gzip decompression failed",
+                    ));
+                }
+            }
+            if result.bytes_written > 0 {
+                return Ok(result.bytes_written);
+            }
+            // No output and no input consumed means no further progress is
+            // possible (truncated stream); stop to avoid spinning forever.
+            if result.bytes_consumed == 0 {
+                break;
+            }
+        }
+
+        Ok(0)
+    }
+}
+
+/// Parses the gzip header and returns the remaining bytes.
+///
+/// # Panics
+///
+/// Panics if `buf` contains an invalid or incomplete gzip header.
+fn strip_gzip_header(buf: &[u8]) -> &[u8] {
+    // The gzip header flag bits.
+    // Reference: <https://datatracker.ietf.org/doc/html/rfc1952>.
+    const FLG_FHCRC: u8 = 0x02;
+    const FLG_FEXTRA: u8 = 0x04;
+    const FLG_FNAME: u8 = 0x08;
+    const FLG_FCOMMENT: u8 = 0x10;
+
+    // Fixed 10-byte header: ID1, ID2, CM, FLG, MTIME(4), XFL, OS.
+    let flg = buf[3];
+    let mut pos = 10;
+
+    if flg & FLG_FEXTRA != 0 {
+        let xlen = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
+        pos += 2 + xlen;
+    }
+    if flg & FLG_FNAME != 0 {
+        pos += buf[pos..].iter().position(|&b| b == 0).unwrap() + 1;
+    }
+    if flg & FLG_FCOMMENT != 0 {
+        pos += buf[pos..].iter().position(|&b| b == 0).unwrap() + 1;
+    }
+    if flg & FLG_FHCRC != 0 {
+        pos += 2;
+    }
+
+    &buf[pos..]
 }
 
 struct InodeWriter<'a> {

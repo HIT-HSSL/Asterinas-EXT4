@@ -6,13 +6,12 @@ use core::sync::atomic::AtomicUsize;
 
 use align_ext::AlignExt;
 use ostd::mm::{FrameAllocOptions, Segment};
-use xarray::XArray;
 
-use super::{Vmo, VmoFlags, WritableMappingStatus};
+use super::{PageArray, Vmo, VmoFlags, WritableMappingStatus};
 use crate::{
     prelude::*,
     vm::{
-        page_cache::{CachePage, CachePageMeta, PageCacheBackend},
+        page_cache::{CachePageMeta, PageCacheBackend},
         vmar::Rmap,
     },
 };
@@ -99,8 +98,9 @@ impl VmoOptions {
             backend,
             ..
         } = self;
-        let vmo = alloc_vmo(size, flags, backend)?;
-        Ok(Arc::new(vmo))
+        let vmo = Arc::new(alloc_vmo(size, flags, backend)?);
+        *vmo.self_ref.lock() = Arc::downgrade(&vmo);
+        Ok(vmo)
     }
 }
 
@@ -120,16 +120,17 @@ fn alloc_vmo(
         size: AtomicUsize::new(size),
         writable_mapping_status,
         rmap: Mutex::new(rmap),
+        self_ref: SpinLock::new(Weak::new()),
     })
 }
 
-fn committed_pages_if_continuous(flags: VmoFlags, size: usize) -> Result<XArray<CachePage>> {
+fn committed_pages_if_continuous(flags: VmoFlags, size: usize) -> Result<PageArray> {
     if flags.contains(VmoFlags::CONTIGUOUS) {
         // if the vmo is continuous, we need to allocate frames for the vmo
         let frames_num = size / PAGE_SIZE;
         let segment: Segment<CachePageMeta> = FrameAllocOptions::new()
             .alloc_segment_with(frames_num, |_| CachePageMeta::default())?;
-        let committed_pages = XArray::new();
+        let committed_pages = PageArray::new();
         let mut locked_pages = committed_pages.lock();
         let mut cursor = locked_pages.cursor_mut(0);
         for frame in segment {
@@ -140,7 +141,7 @@ fn committed_pages_if_continuous(flags: VmoFlags, size: usize) -> Result<XArray<
         Ok(committed_pages)
     } else {
         // otherwise, we wait for the page is read or write
-        Ok(XArray::new())
+        Ok(PageArray::new())
     }
 }
 

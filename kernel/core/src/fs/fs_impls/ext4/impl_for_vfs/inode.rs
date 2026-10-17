@@ -15,7 +15,7 @@ use device_id::DeviceId;
 use crate::{
     device,
     fs::{
-        file::{AccessMode, InodeMode, InodeType, PerOpenFileOps, StatusFlags},
+        file::{AccessMode, InodeMode, InodeType, PerOpenFileOps, StatusFlags, SyncMode},
         fs_impls::ext4::{FilePerm, Inode as Ext4Inode},
         utils::DirentVisitor,
         vfs::{
@@ -52,11 +52,19 @@ impl FileOps for Ext4Inode {
         reader: &mut VmReader,
         status_flags: StatusFlags,
     ) -> Result<usize> {
-        if status_flags.contains(StatusFlags::O_DIRECT) {
+        let written = if status_flags.contains(StatusFlags::O_DIRECT) {
             self.write_direct_at(offset, reader)
         } else {
             self.write_at(offset, reader)
+        }?;
+        if written != 0 {
+            if status_flags.contains(StatusFlags::O_SYNC) {
+                self.sync_all()?;
+            } else if status_flags.contains(StatusFlags::O_DSYNC) {
+                self.sync_data()?;
+            }
         }
+        Ok(written)
     }
 
     fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
@@ -200,12 +208,14 @@ impl Inode for Ext4Inode {
         self.link(old, name)
     }
 
-    fn unlink(&self, name: &str) -> Result<()> {
-        self.unlink(name)
+    fn unlink(&self, name: &str, child: &Arc<dyn Inode>) -> Result<()> {
+        let child = child.downcast_ref::<Ext4Inode>().unwrap();
+        self.unlink(name, child)
     }
 
-    fn rmdir(&self, name: &str) -> Result<()> {
-        self.rmdir(name)
+    fn rmdir(&self, name: &str, child: &Arc<dyn Inode>) -> Result<()> {
+        let child = child.downcast_ref::<Ext4Inode>().unwrap();
+        self.rmdir(name, child)
     }
 
     fn rename(
@@ -236,15 +246,13 @@ impl Inode for Ext4Inode {
         self.write_link(target)
     }
 
-    fn sync_all(&self) -> Result<()> {
-        self.sync_all()
-    }
-
-    fn sync_data(&self) -> Result<()> {
-        // fdatasync semantics: the xattr block is deliberately not flushed.
-        let fs = self.fs()?;
-        fs.sync_metadata()?;
-        self.sync_data()
+    fn sync(&self, mode: SyncMode) -> Result<()> {
+        let fs = Ext4Inode::fs(self)?;
+        fs.writeback_controller()
+            .with_submission_allowed(|| match mode {
+                SyncMode::Data => self.sync_data(),
+                SyncMode::Full => self.sync_all(),
+            })
     }
 
     fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {

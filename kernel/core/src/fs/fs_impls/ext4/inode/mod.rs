@@ -30,18 +30,20 @@
 //! The xattr's interior lock is likewise independent of `inner`: the two are
 //! never held at the same time.
 //!
-//! `BlockGroup::inode_table_lock` is a leaf: it serializes inode-slot
-//! read-modify-writes and only device I/O happens while it is held.
+//! `BlockGroup::inode_table_cache` is a leaf: it serializes cache fill and
+//! neighboring inode-slot updates, and only inode-table I/O happens while held.
 
 #![short_vis_path::add(ext4)]
 
 mod attrs;
-mod block_mapping;
+pub(in ext4) mod block_mapping;
 mod dir;
 mod disk;
 mod file;
 mod symlink;
 mod sync;
+
+pub(super) use dir::recover_rename;
 
 use self::{block_mapping::BlockMapping, symlink::FastSymlinkTarget};
 use super::{fs::Ext4, prelude::*, xattr::Xattr};
@@ -96,6 +98,14 @@ pub(crate) struct Inode {
     /// The VFS extension slot (flock, POSIX locks, inotify); must exist from
     /// day one or the VFS layer panics on inodes that use these features.
     extension: Extension,
+    /// Block groups whose allocation metadata was changed by this inode.
+    ///
+    /// The mutex is held across targeted metadata writeback. This makes a
+    /// concurrent mutation wait until the current snapshot is durable instead
+    /// of requiring a per-inode generation counter.
+    allocation_metadata_groups: Mutex<BTreeSet<usize>>,
+    release_metadata_groups: Mutex<BTreeSet<usize>>,
+    self_ref: Weak<Inode>,
 }
 
 impl Inode {
@@ -106,12 +116,12 @@ impl Inode {
         block_group_idx: usize,
         fs: Weak<Ext4>,
     ) -> Result<Arc<Self>> {
-        let payload = InodePayload::new(&desc, fs.clone())?;
+        let payload = InodePayload::new(ino, &desc, fs.clone())?;
         let pipe = match type_ {
             InodeType::NamedPipe => Some(Pipe::new()),
             _ => None,
         };
-        Ok(Arc::new_cyclic(|weak_self: &Weak<Self>| {
+        let inode = Arc::new_cyclic(|weak_self: &Weak<Self>| {
             let xattr = match type_ {
                 InodeType::Dir | InodeType::File => {
                     Some(Xattr::new(desc.file_acl(), weak_self.clone(), fs.clone()))
@@ -127,8 +137,15 @@ impl Inode {
                 xattr,
                 pipe,
                 extension: Extension::new(),
+                allocation_metadata_groups: Mutex::new(BTreeSet::new()),
+                release_metadata_groups: Mutex::new(BTreeSet::new()),
+                self_ref: weak_self.clone(),
             }
-        }))
+        });
+        if let Ok(block_manager) = inode.inner.read().block_manager() {
+            block_manager.bind_writeback_target(Arc::downgrade(&inode));
+        }
+        Ok(inode)
     }
 
     pub(super) fn ino(&self) -> Ext4Ino {
@@ -158,6 +175,32 @@ impl Inode {
         self.inner.read().sector_count()
     }
 
+    /// Resolves the first `nblocks` of an internal file to allocated SSD
+    /// blocks. The journal inode uses this to turn its extent mapping into a
+    /// stable log-block map at mount time.
+    pub(in ext4) fn map_allocated_blocks(&self, nblocks: u32) -> Result<Vec<Ext4Bid>> {
+        let inner = self.inner.read();
+        let manager = inner.block_manager()?;
+        let mut blocks = Vec::with_capacity(nblocks as usize);
+        let mut iblock = 0;
+        while iblock < nblocks {
+            let mapping = manager.map_blocks(iblock)?;
+            if mapping.reads_as_zeros() {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "internal inode contains a hole or unwritten block"
+                );
+            }
+            let pblock = mapping.pblock().ok_or_else(|| {
+                Error::with_message(Errno::EUCLEAN, "internal inode is not SSD-backed")
+            })?;
+            let run = mapping.len().min(nblocks - iblock);
+            blocks.extend((0..run).map(|offset| pblock + Ext4Bid::from(offset)));
+            iblock += run;
+        }
+        Ok(blocks)
+    }
+
     pub(super) fn extension(&self) -> &Extension {
         &self.extension
     }
@@ -175,6 +218,77 @@ impl Inode {
             .ok()
             .map(PageCache::as_vmo)
             .cloned()
+    }
+
+    pub(in ext4) fn touch_metadata_range(&self, fs: &Ext4, range: Range<Ext4Bid>) {
+        if range.is_empty() {
+            return;
+        }
+        let mut groups = self.allocation_metadata_groups.lock();
+        fs.record_block_group_range(&mut groups, range);
+    }
+
+    pub(in ext4) fn touch_metadata_group(&self, group_idx: usize) {
+        self.allocation_metadata_groups.lock().insert(group_idx);
+    }
+
+    pub(in ext4) fn touch_released_metadata_range(&self, fs: &Ext4, range: Range<Ext4Bid>) {
+        if range.is_empty() {
+            return;
+        }
+        let mut groups = self.release_metadata_groups.lock();
+        fs.record_block_group_range(&mut groups, range);
+    }
+
+    pub(in ext4) fn touch_released_metadata_group(&self, group_idx: usize) {
+        self.release_metadata_groups.lock().insert(group_idx);
+    }
+
+    fn sync_metadata_group_set(groups: &Mutex<BTreeSet<usize>>, fs: &Ext4) -> Result<()> {
+        let mut groups = groups.lock();
+        if groups.is_empty() {
+            return Ok(());
+        }
+        fs.sync_metadata_groups(groups.iter().copied())?;
+        groups.clear();
+        Ok(())
+    }
+
+    fn write_back_with_metadata_dependencies(
+        &self,
+        fs: &Ext4,
+        inner: &mut InodeInner,
+    ) -> Result<()> {
+        Self::sync_metadata_group_set(&self.allocation_metadata_groups, fs)?;
+        inner.write_back_inode_desc(fs, self.ino)?;
+        Self::sync_metadata_group_set(&self.release_metadata_groups, fs)
+    }
+
+    pub(in ext4) fn reclaim_extent_root(&self) -> Result<[u32; RAW_BLOCK_PTRS_LEN]> {
+        let inner = self.inner.read();
+        match &inner.payload {
+            InodePayload::DataBacked { block_manager, .. } => block_manager.reclaim_extent_root(),
+            _ => Ok(empty_extent_root()),
+        }
+    }
+
+    pub(in ext4) fn drain_nv_data(&self) -> Result<()> {
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        let Ok(block_manager) = inner.block_manager().cloned() else {
+            return Ok(());
+        };
+        block_manager.drain_nv_data()?;
+        self.write_back_with_metadata_dependencies(&fs, &mut inner)
+    }
+
+    pub(in ext4) const fn reclaim_inode_type(&self) -> InodeType {
+        self.type_
+    }
+
+    pub(in ext4) fn reclaim_xattr_block(&self) -> Option<Ext4Bid> {
+        let file_acl = self.inner.read().desc.file_acl();
+        (file_acl != 0).then_some(file_acl)
     }
 }
 
@@ -335,9 +449,9 @@ impl InodeInner {
 }
 
 impl InodePayload {
-    fn new(desc: &InodeDesc, fs: Weak<Ext4>) -> Result<Self> {
+    fn new(ino: Ext4Ino, desc: &InodeDesc, fs: Weak<Ext4>) -> Result<Self> {
         Ok(match desc.type_() {
-            InodeType::File | InodeType::Dir => Self::new_data_backed(desc, fs)?,
+            InodeType::File | InodeType::Dir => Self::new_data_backed(ino, desc, fs)?,
             // A symlink is fast (inline) when it owns no data blocks (the
             // `is_fast_symlink` rule); otherwise its target lives in a mapped
             // data block. A freshly created symlink (before `write_link`)
@@ -350,7 +464,7 @@ impl InodePayload {
                         target: FastSymlinkTarget::new(*desc.raw_block()),
                     }
                 } else {
-                    Self::new_data_backed(desc, fs)?
+                    Self::new_data_backed(ino, desc, fs)?
                 }
             }
             InodeType::CharDevice | InodeType::BlockDevice => Self::Device {
@@ -360,9 +474,9 @@ impl InodePayload {
         })
     }
 
-    fn new_data_backed(desc: &InodeDesc, fs: Weak<Ext4>) -> Result<Self> {
+    fn new_data_backed(ino: Ext4Ino, desc: &InodeDesc, fs: Weak<Ext4>) -> Result<Self> {
         let size = usize::try_from(desc.size()).expect("Asterinas supports 64-bit architectures");
-        let mapping = BlockMapping::new(desc, fs, size.align_up(PAGE_SIZE) / PAGE_SIZE)?;
+        let mapping = BlockMapping::new(ino, desc, fs, size.align_up(PAGE_SIZE) / PAGE_SIZE)?;
         Ok(Self::from_mapping(mapping, size))
     }
 
@@ -370,9 +484,14 @@ impl InodePayload {
     /// inode's current file size (like ext2's fast-to-slow rebuild): the page
     /// cache must cover `[0, size)` because `prepare_write` grows it relative
     /// to the descriptor's size, not the cache's.
-    fn new_data_backed_empty(fs: Weak<Ext4>, extent_based: bool, size: usize) -> Result<Self> {
+    fn new_data_backed_empty(
+        ino: Ext4Ino,
+        fs: Weak<Ext4>,
+        extent_based: bool,
+        size: usize,
+    ) -> Result<Self> {
         let npages = size.align_up(PAGE_SIZE) / PAGE_SIZE;
-        let mapping = BlockMapping::new_empty(fs, extent_based, npages)?;
+        let mapping = BlockMapping::new_empty(ino, fs, extent_based, npages)?;
         Ok(Self::from_mapping(mapping, size))
     }
 

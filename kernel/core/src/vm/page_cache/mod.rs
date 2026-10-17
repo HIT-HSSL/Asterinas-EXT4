@@ -104,13 +104,17 @@
 //!    lock of VMO pages. For details, see the comments in the implementation.
 
 use core::{
+    fmt::Debug,
     ops::{Deref, Range},
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use align_ext::AlignExt;
 use aster_block::bio::{BioCompleteFn, BioDirection, BioSegment, BioStatus};
-use io_util::batch::IoBatch;
+use io_util::{
+    IoError,
+    batch::{IoBatch, IoCompletion},
+};
 use ostd::mm::{Segment, VmIo, VmIoFill, io::util::HasVmReaderWriter};
 
 use crate::prelude::*;
@@ -302,6 +306,38 @@ impl PageCache {
         vmo.flush_dirty_pages(&range)
     }
 
+    /// Flushes at most `max_pages` candidates from a range.
+    ///
+    /// Filesystem background writers use this bounded primitive for fair,
+    /// memory-limited scheduling. Explicit synchronization should use
+    /// [`Self::flush_range`] to drain the complete range.
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(crate) fn flush_range_batch(&self, range: Range<usize>, max_pages: usize) -> Result<bool> {
+        if max_pages == 0 {
+            return_errno_with_message!(Errno::EINVAL, "writeback batch must contain pages");
+        }
+        let Some(vmo) = self.0.as_backed_vmo() else {
+            return Ok(false);
+        };
+        vmo.flush_dirty_pages_batch(&range, max_pages)
+    }
+
+    /// Flushes one bounded writeback batch using the requested completion mode.
+    pub(crate) fn flush_range_batch_with_mode(
+        &self,
+        range: Range<usize>,
+        max_pages: usize,
+        mode: WritebackMode,
+    ) -> Result<WritebackBatchResult> {
+        if max_pages == 0 {
+            return_errno_with_message!(Errno::EINVAL, "writeback batch must contain pages");
+        }
+        let Some(vmo) = self.0.as_backed_vmo() else {
+            return Ok(WritebackBatchResult::empty());
+        };
+        vmo.flush_dirty_pages_batch_with_mode(&range, max_pages, mode)
+    }
+
     /// Evicts clean pages within the specified range from the page cache.
     ///
     /// Only pages in the `UpToDate` state are removed. Dirty and uninitialized
@@ -338,6 +374,18 @@ impl PageCache {
     pub(crate) fn fill_zeros(&self, range: Range<usize>) -> Result<()> {
         self.0.fill_zeros(range)
     }
+
+    /// Returns the contiguous byte ranges backed by dirty pages in `range`.
+    ///
+    /// Filesystems may use this snapshot to prepare storage mappings before
+    /// asking the page cache to submit writeback.
+    #[cfg(ktest)]
+    pub(crate) fn dirty_ranges(&self, range: Range<usize>) -> Vec<Range<usize>> {
+        let Some(vmo) = self.0.as_backed_vmo() else {
+            return Vec::new();
+        };
+        vmo.dirty_ranges(&range)
+    }
 }
 
 impl VmIo for PageCache {
@@ -366,6 +414,20 @@ impl VmIo for PageCache {
 /// block-device BIOs, such as network filesystems. Filesystems backed by block
 /// devices usually implement [`BlockAsPageCacheBackend`] instead.
 pub(crate) trait PageCacheBackend: Sync + Send {
+    /// Returns an optional owner-specific observer for page writeback state.
+    fn writeback_observer(&self) -> Option<Arc<dyn PageCacheWritebackObserver>> {
+        None
+    }
+
+    /// Returns the dispatcher used by this backend's writeback implementation.
+    ///
+    /// Direct backends remain synchronous by default. An implementation may
+    /// return a dispatcher only if its `write_pages_async` path preserves each
+    /// `WritebackPage` and submits it through the PageCache writeback helpers.
+    fn writeback_completion_dispatcher(&self) -> Option<Arc<dyn WritebackCompletionDispatcher>> {
+        None
+    }
+
     /// Reads a page from the backend asynchronously.
     ///
     /// The caller may try to pass an index that exceeds the size of the
@@ -394,6 +456,365 @@ pub(crate) trait PageCacheBackend: Sync + Send {
         locked_page: LockedCachePage,
         io_batch: &mut IoBatch,
     ) -> Result<()>;
+
+    /// Writes a sorted batch of independently owned page candidates.
+    ///
+    /// Backends may override this method to choose I/O boundaries using their
+    /// own mapping information. The default preserves the per-page behavior.
+    fn write_pages_async(&self, pages: Vec<WritebackPage>, io_batch: &mut IoBatch) -> Result<()> {
+        for page in pages {
+            let claimed = page.claim_handle();
+            let (idx, locked_page, _) = page.into_parts();
+            self.write_page_async(idx, locked_page, io_batch)?;
+            claimed.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+}
+
+/// One locked dirty page offered to a backend for writeback.
+///
+/// Each candidate remains independently splittable until the backend chooses
+/// an I/O run. Dropping an unprepared candidate unlocks it without cleaning it.
+pub(crate) struct WritebackPage {
+    idx: usize,
+    locked_page: LockedCachePage,
+    observer: Option<Arc<dyn PageCacheWritebackObserver>>,
+    claimed: Arc<AtomicBool>,
+    vmo: Option<Arc<Vmo>>,
+    batch_fence: Option<WritebackBatchFence>,
+    dispatcher: Option<Arc<dyn WritebackCompletionDispatcher>>,
+}
+
+impl WritebackPage {
+    fn new(
+        idx: usize,
+        locked_page: LockedCachePage,
+        observer: Option<Arc<dyn PageCacheWritebackObserver>>,
+    ) -> Self {
+        Self {
+            idx,
+            locked_page,
+            observer,
+            claimed: Arc::new(AtomicBool::new(false)),
+            vmo: None,
+            batch_fence: None,
+            dispatcher: None,
+        }
+    }
+
+    pub(crate) fn index(&self) -> usize {
+        self.idx
+    }
+
+    fn claim_handle(&self) -> Arc<AtomicBool> {
+        self.claimed.clone()
+    }
+
+    pub(super) fn bind_vmo(&mut self, vmo: Arc<Vmo>) {
+        self.vmo = Some(vmo);
+    }
+
+    pub(super) fn bind_batch_fence(&mut self, batch_fence: WritebackBatchFence) {
+        self.batch_fence = Some(batch_fence);
+    }
+
+    pub(super) fn bind_dispatcher(&mut self, dispatcher: Arc<dyn WritebackCompletionDispatcher>) {
+        self.dispatcher = Some(dispatcher);
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        usize,
+        LockedCachePage,
+        Option<Arc<dyn PageCacheWritebackObserver>>,
+    ) {
+        (self.idx, self.locked_page, self.observer)
+    }
+
+    fn into_writeback_parts(self) -> WritebackPageParts {
+        (
+            self.idx,
+            self.locked_page,
+            self.observer,
+            self.claimed,
+            self.vmo.expect("writeback page must be bound to its VMO"),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WritebackMode {
+    Background,
+    Sync,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct WritebackSequence(u64);
+
+impl WritebackSequence {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+/// Records exactly the dispatcher sequences prepared by one flush operation.
+#[derive(Clone)]
+pub(super) struct WritebackBatchFence(Arc<SpinLock<Option<WritebackSequence>>>);
+
+impl WritebackBatchFence {
+    pub(super) fn new() -> Self {
+        Self(Arc::new(SpinLock::new(None)))
+    }
+
+    fn record(&self, sequence: WritebackSequence) {
+        let mut fence = self.0.lock();
+        *fence = Some(fence.map_or(sequence, |current| current.max(sequence)));
+    }
+
+    pub(super) fn sequence(&self) -> Option<WritebackSequence> {
+        *self.0.lock()
+    }
+}
+
+pub(crate) struct PreparedWritebackCompletion {
+    pub(crate) complete_fn: BioCompleteFn,
+    pub(crate) sequence: WritebackSequence,
+}
+
+pub(crate) trait WritebackCompletionDispatcher: Debug + Send + Sync {
+    /// On error, `prepare` must leave `completion` intact. On success, the
+    /// dispatcher owns it and must finish it exactly once.
+    fn prepare(
+        &self,
+        completion: &mut Option<WritebackCompletion>,
+        nr_pages: usize,
+    ) -> Result<PreparedWritebackCompletion>;
+
+    fn finish_submission_failure(&self, sequence: WritebackSequence, error: Error);
+
+    /// Returns a global completion-progress sequence for credit-pressure waits.
+    fn completion_progress(&self) -> u64;
+
+    /// Waits until at least one completion has made progress since `observed`.
+    fn wait_for_completion_progress_since(&self, observed: u64);
+
+    /// Returns the latest sequence submitted for this dispatcher's mapping.
+    fn latest_sequence(&self) -> Option<WritebackSequence>;
+
+    fn wait_through(&self, sequence: WritebackSequence) -> Result<()>;
+
+    /// Consumes one persistent error at or before `sequence` after a synchronous
+    /// caller has observed it.
+    fn consume_error_through(&self, sequence: WritebackSequence) -> Option<Error>;
+}
+
+type WritebackPageParts = (
+    usize,
+    LockedCachePage,
+    Option<Arc<dyn PageCacheWritebackObserver>>,
+    Arc<AtomicBool>,
+    Arc<Vmo>,
+);
+
+pub(crate) trait WritebackPostIo: Any + Send {
+    fn finish(self: Box<Self>, status: BioStatus) -> core::result::Result<(), IoError>;
+
+    fn as_any(&self) -> &dyn Any;
+
+    fn try_merge(
+        &mut self,
+        next: Box<dyn WritebackPostIo>,
+    ) -> core::result::Result<(), Box<dyn WritebackPostIo>> {
+        Err(next)
+    }
+}
+
+struct ClosureWritebackPostIo<F>(Option<F>);
+
+impl<F> WritebackPostIo for ClosureWritebackPostIo<F>
+where
+    F: FnOnce(BioStatus) -> core::result::Result<(), IoError> + Send + 'static,
+{
+    fn finish(mut self: Box<Self>, status: BioStatus) -> core::result::Result<(), IoError> {
+        self.0.take().unwrap()(status)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+struct WritebackPageCompletion {
+    idx: usize,
+    page: CachePage,
+    observer: Option<Arc<dyn PageCacheWritebackObserver>>,
+    vmo: Arc<Vmo>,
+}
+
+/// Owns the PageCache state associated with a submitted writeback run.
+pub(crate) struct WritebackCompletion {
+    pages: Vec<WritebackPageCompletion>,
+    post_io: Option<Box<dyn WritebackPostIo>>,
+}
+
+impl WritebackCompletion {
+    fn new_with_post_io(
+        pages: Vec<WritebackPageCompletion>,
+        post_io: Box<dyn WritebackPostIo>,
+    ) -> Self {
+        Self {
+            pages,
+            post_io: Some(post_io),
+        }
+    }
+
+    pub(crate) fn try_merge(
+        &mut self,
+        mut next: WritebackCompletion,
+    ) -> core::result::Result<(), WritebackCompletion> {
+        let next_post_io = next.post_io.take().unwrap();
+        match self.post_io.as_mut().unwrap().try_merge(next_post_io) {
+            Ok(()) => {
+                self.pages.append(&mut next.pages);
+                Ok(())
+            }
+            Err(next_post_io) => {
+                next.post_io = Some(next_post_io);
+                Err(next)
+            }
+        }
+    }
+
+    pub(crate) fn finish(self, status: BioStatus) -> Result<()> {
+        self.finish_io(status).map_err(Error::from)
+    }
+
+    fn finish_io(mut self, status: BioStatus) -> core::result::Result<(), IoError> {
+        let result = if status == BioStatus::Complete {
+            self.post_io.take().unwrap().finish(status)
+        } else {
+            Err(io_error_from_bio_status(status))
+        };
+        let succeeded = result.is_ok();
+        for page in self.pages {
+            let locked_page = page.page.lock();
+            if succeeded {
+                let was_redirtied = locked_page.state().is_dirty();
+                locked_page.clear_writing_back();
+                if was_redirtied {
+                    page.vmo.set_page_mark_if_same(
+                        page.idx,
+                        &locked_page,
+                        vmo::PageCacheMark::Dirty,
+                    );
+                } else if let Some(observer) = page.observer {
+                    observer.page_cleaned(page.idx);
+                }
+            } else {
+                locked_page.set_dirty();
+                locked_page.clear_writing_back();
+                page.vmo
+                    .set_page_mark_if_same(page.idx, &locked_page, vmo::PageCacheMark::Dirty);
+            }
+            page.vmo
+                .unset_page_mark_if_same(page.idx, &locked_page, vmo::PageCacheMark::Writeback);
+        }
+        result
+    }
+}
+
+pub(crate) struct WritebackBatchResult {
+    dispatcher: Option<Arc<dyn WritebackCompletionDispatcher>>,
+    fence: Option<WritebackSequence>,
+    had_work: bool,
+    retry_after_completion: bool,
+}
+
+impl WritebackBatchResult {
+    pub(crate) fn empty() -> Self {
+        Self {
+            dispatcher: None,
+            fence: None,
+            had_work: false,
+            retry_after_completion: false,
+        }
+    }
+
+    pub(super) fn blocked_on_writeback() -> Self {
+        Self {
+            dispatcher: None,
+            fence: None,
+            had_work: false,
+            retry_after_completion: true,
+        }
+    }
+
+    pub(super) fn completed() -> Self {
+        Self {
+            dispatcher: None,
+            fence: None,
+            had_work: true,
+            retry_after_completion: false,
+        }
+    }
+
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(crate) fn wait(self) -> Result<()> {
+        if let (Some(dispatcher), Some(sequence)) = (self.dispatcher, self.fence) {
+            dispatcher.wait_through(sequence)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn wait_and_consume_error(self) -> Result<()> {
+        if let (Some(dispatcher), Some(sequence)) = (self.dispatcher, self.fence) {
+            if let Err(error) = dispatcher.wait_through(sequence) {
+                return Err(dispatcher.consume_error_through(sequence).unwrap_or(error));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn detached(
+        dispatcher: Arc<dyn WritebackCompletionDispatcher>,
+        fence: Option<WritebackSequence>,
+    ) -> Self {
+        Self {
+            dispatcher: Some(dispatcher),
+            fence,
+            had_work: true,
+            retry_after_completion: false,
+        }
+    }
+
+    pub(crate) fn had_work(&self) -> bool {
+        self.had_work
+    }
+
+    pub(crate) fn retry_after_completion(&self) -> bool {
+        self.retry_after_completion
+    }
+}
+
+/// Receives page-state events without owning writeback policy.
+///
+/// Callbacks may run while the page lock is held. Implementations must remain
+/// non-blocking and must not acquire inode, page-cache, XArray, or reverse-map
+/// locks; atomic accounting, short independent queue locks, and wakeups are
+/// permitted.
+pub(crate) trait PageCacheWritebackObserver: Debug + Send + Sync {
+    fn page_dirtied(&self, page_idx: usize);
+    fn page_cleaned(&self, page_idx: usize);
+
+    fn writeback_completion_dispatcher(&self) -> Option<Arc<dyn WritebackCompletionDispatcher>> {
+        None
+    }
 }
 
 impl dyn PageCacheBackend {
@@ -422,6 +843,10 @@ impl dyn PageCacheBackend {
 // TODO: This trait should provide interfaces for reading or writing multiple
 // pages in a single BIO to improve efficiency for sequential I/O.
 pub(crate) trait BlockAsPageCacheBackend: Sync + Send {
+    fn writeback_observer(&self) -> Option<Arc<dyn PageCacheWritebackObserver>> {
+        None
+    }
+
     /// Submits read I/O for the page at `idx`.
     ///
     /// `bio_segment` identifies the page memory that must receive the data.
@@ -458,9 +883,175 @@ pub(crate) trait BlockAsPageCacheBackend: Sync + Send {
         complete_fn: BioCompleteFn,
         io_batch: &mut IoBatch,
     ) -> Result<()>;
+
+    /// Chooses and submits BIOs for a sorted batch of writeback candidates.
+    ///
+    /// Filesystems with extent information can override this method to build
+    /// multi-page BIOs. Other block backends retain deterministic per-page I/O.
+    fn submit_write_pages(&self, pages: Vec<WritebackPage>, io_batch: &mut IoBatch) -> Result<()> {
+        for page in pages {
+            submit_one_block_write_page(self, page, io_batch)?;
+        }
+        Ok(())
+    }
+}
+
+/// Snapshots and marks a filesystem-selected run as writeback, then delegates
+/// construction of the actual BIO to `submit`.
+pub(crate) fn submit_writeback_run(
+    pages: Vec<WritebackPage>,
+    io_batch: &mut IoBatch,
+    submit: impl FnOnce(Vec<BioSegment>, BioCompleteFn, &mut IoBatch) -> Result<()>,
+) -> Result<()> {
+    submit_writeback_run_with_post_io(pages, io_batch, submit, |_| Ok(()))
+}
+
+/// Like [`submit_writeback_run`], with a process-context step after device I/O
+/// and before pages are declared clean.
+pub(crate) fn submit_writeback_run_with_post_io(
+    pages: Vec<WritebackPage>,
+    io_batch: &mut IoBatch,
+    submit: impl FnOnce(Vec<BioSegment>, BioCompleteFn, &mut IoBatch) -> Result<()>,
+    post_io: impl FnOnce(BioStatus) -> core::result::Result<(), IoError> + Send + 'static,
+) -> Result<()> {
+    submit_writeback_run_with_post_io_job(
+        pages,
+        io_batch,
+        submit,
+        Box::new(ClosureWritebackPostIo(Some(post_io))),
+    )
+}
+
+/// Like [`submit_writeback_run_with_post_io`], with a merge-aware post-I/O job.
+pub(crate) fn submit_writeback_run_with_post_io_job(
+    pages: Vec<WritebackPage>,
+    io_batch: &mut IoBatch,
+    submit: impl FnOnce(Vec<BioSegment>, BioCompleteFn, &mut IoBatch) -> Result<()>,
+    post_io: Box<dyn WritebackPostIo>,
+) -> Result<()> {
+    debug_assert!(!pages.is_empty());
+
+    let dispatcher = pages
+        .first()
+        .and_then(|page| page.dispatcher.as_ref().cloned());
+    let batch_fence = pages
+        .first()
+        .and_then(|page| page.batch_fence.as_ref().cloned());
+    let nr_pages = pages.len();
+    let mut completion_pages = Vec::with_capacity(nr_pages);
+    // The filesystem has already verified that this run maps to contiguous
+    // device blocks, so one DMA snapshot avoids a descriptor per cache page.
+    let bio_segment = BioSegment::alloc(pages.len(), BioDirection::ToDevice);
+    {
+        let mut segment_writer = bio_segment.writer().unwrap();
+        for page in pages {
+            let (idx, locked_page, observer, claimed, vmo) = page.into_writeback_parts();
+            let locked_page = locked_page.wait_until_finish_writing_back();
+
+            segment_writer.write(&mut locked_page.reader());
+
+            locked_page.set_writing_back();
+            locked_page.set_up_to_date();
+            claimed.store(true, Ordering::Release);
+            completion_pages.push(WritebackPageCompletion {
+                idx,
+                page: locked_page.unlock(),
+                observer,
+                vmo,
+            });
+        }
+    }
+    let mut completion = Some(WritebackCompletion::new_with_post_io(
+        completion_pages,
+        post_io,
+    ));
+
+    if let Some(dispatcher) = dispatcher {
+        let prepared = match dispatcher.prepare(&mut completion, nr_pages) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                completion.take().unwrap().finish(BioStatus::IoError).ok();
+                return Err(err);
+            }
+        };
+        if let Some(batch_fence) = batch_fence {
+            batch_fence.record(prepared.sequence);
+        }
+        let res = submit(vec![bio_segment], prepared.complete_fn, io_batch);
+        if let Err(error) = &res {
+            dispatcher.finish_submission_failure(prepared.sequence, *error);
+        }
+        return res;
+    }
+
+    let status = Arc::new(AtomicU32::new(BioStatus::Init as u32));
+    let completion_status = status.clone();
+    let complete_fn: BioCompleteFn = Box::new(move |status| {
+        completion_status.store(status as u32, Ordering::Release);
+    });
+    let res = submit(vec![bio_segment], complete_fn, io_batch);
+    if res.is_ok() {
+        io_batch.push(Arc::new(DeferredWritebackCompletion {
+            status,
+            completion: SpinLock::new(completion),
+        }));
+    } else {
+        completion.unwrap().finish(BioStatus::IoError).ok();
+    }
+    res
+}
+
+fn submit_one_block_write_page<T: BlockAsPageCacheBackend + ?Sized>(
+    backend: &T,
+    page: WritebackPage,
+    io_batch: &mut IoBatch,
+) -> Result<()> {
+    let idx = page.index();
+    submit_writeback_run(
+        vec![page],
+        io_batch,
+        |mut segments, complete_fn, io_batch| {
+            backend.submit_write_bio(idx, segments.pop().unwrap(), complete_fn, io_batch)
+        },
+    )
+}
+
+struct DeferredWritebackCompletion {
+    status: Arc<AtomicU32>,
+    completion: SpinLock<Option<WritebackCompletion>>,
+}
+
+impl IoCompletion for DeferredWritebackCompletion {
+    fn wait(&self) -> core::result::Result<(), IoError> {
+        let status =
+            BioStatus::try_from(self.status.load(Ordering::Acquire)).unwrap_or(BioStatus::IoError);
+        let completion = self
+            .completion
+            .lock()
+            .take()
+            .expect("deferred writeback completion waited twice");
+        completion.finish_io(status)
+    }
+}
+
+fn io_error_from_bio_status(status: BioStatus) -> IoError {
+    match status {
+        BioStatus::NotSupported => IoError::Unsupported,
+        BioStatus::NoSpace => IoError::OutOfSpace,
+        _ => IoError::Failed,
+    }
 }
 
 impl<T: BlockAsPageCacheBackend> PageCacheBackend for T {
+    fn writeback_observer(&self) -> Option<Arc<dyn PageCacheWritebackObserver>> {
+        BlockAsPageCacheBackend::writeback_observer(self)
+    }
+
+    fn writeback_completion_dispatcher(&self) -> Option<Arc<dyn WritebackCompletionDispatcher>> {
+        BlockAsPageCacheBackend::writeback_observer(self)
+            .and_then(|observer| observer.writeback_completion_dispatcher())
+    }
+
     fn read_page_async(
         &self,
         idx: usize,
@@ -491,47 +1082,14 @@ impl<T: BlockAsPageCacheBackend> PageCacheBackend for T {
         locked_page: LockedCachePage,
         io_batch: &mut IoBatch,
     ) -> Result<()> {
-        locked_page.wait_until_finish_writing_back();
+        submit_one_block_write_page(
+            self,
+            WritebackPage::new(idx, locked_page, self.writeback_observer()),
+            io_batch,
+        )
+    }
 
-        let bio_segment = BioSegment::alloc(1, BioDirection::ToDevice);
-        bio_segment
-            .writer()
-            .unwrap()
-            .write(&mut locked_page.reader());
-
-        locked_page.set_writing_back();
-        locked_page.set_up_to_date();
-
-        let page = locked_page.unlock();
-        let submit_page = page.clone();
-
-        let complete_fn: BioCompleteFn = Box::new(move |status| {
-            submit_page.clear_writing_back();
-            if status != BioStatus::Complete {
-                // TODO: Record the writeback error (e.g., EIO) in the VMO
-                // (or the corresponding inode) so that a subsequent sync syscall
-                // can detect and report it to userspace.
-                //
-                // Following Linux's design, we intentionally do **not** re-dirty the
-                // page here. Re-dirtying would cause the writeback mechanism to retry
-                // the I/O indefinitely, which could stall the entire system if the
-                // underlying device has a persistent hardware fault. Instead, the page
-                // is left clean and the data is considered lost.
-                ostd::error!(
-                    "writeback I/O failed for page index {idx} with status {status:?}; data may be lost"
-                );
-            }
-        });
-
-        let res = self.submit_write_bio(idx, bio_segment, complete_fn, io_batch);
-        if res.is_err() {
-            // If submission fails, re-dirty the page so the next writeback can
-            // retry the data that never reached the device queue.
-            let locked_page = page.lock();
-            locked_page.set_dirty();
-            locked_page.clear_writing_back();
-        }
-
-        res
+    fn write_pages_async(&self, pages: Vec<WritebackPage>, io_batch: &mut IoBatch) -> Result<()> {
+        self.submit_write_pages(pages, io_batch)
     }
 }

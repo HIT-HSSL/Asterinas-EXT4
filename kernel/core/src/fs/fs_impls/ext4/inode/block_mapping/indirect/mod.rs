@@ -10,7 +10,7 @@
 mod block_ptr_tree;
 mod indirect_block;
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use self::block_ptr_tree::{BlockPtrTree, RawBlockPtrs, ResolvedBlockRange};
 use super::{
@@ -19,6 +19,10 @@ use super::{
         RAW_BLOCK_PTRS_LEN,
     },
     MapState, Mapping,
+};
+use crate::{
+    fs::fs_impls::ext4::{inode::Inode, writeback::Ext4PageWritebackObserver},
+    vm::page_cache::PageCacheWritebackObserver,
 };
 
 /// On-disk width of an ext2-style block pointer.
@@ -43,11 +47,15 @@ pub(in super::super) struct IndirectManager {
     npages: AtomicUsize,
     /// File system handle for indirect I/O and BIO submission.
     fs: Weak<Ext4>,
+    /// Directory contents are filesystem metadata and use NV metadata frames.
+    metadata_data: AtomicBool,
+    writeback_observer: Arc<Ext4PageWritebackObserver>,
 }
 
 impl IndirectManager {
     /// Creates the engine from the inode's on-disk `i_block` and `i_blocks`.
     pub(super) fn new(
+        ino: Ext4Ino,
         root: [u32; RAW_BLOCK_PTRS_LEN],
         sector_count: u64,
         fs: Weak<Ext4>,
@@ -61,12 +69,29 @@ impl IndirectManager {
                 "inode sector count exceeds the 32-bit format limit",
             )
         })?;
-        let tree = BlockPtrTree::new(RawBlockPtrs::new(sector_count, root), fs.clone());
+        let writeback_observer = Ext4PageWritebackObserver::new(fs.clone(), ino);
+        let tree = BlockPtrTree::new(
+            RawBlockPtrs::new(sector_count, root),
+            fs.clone(),
+            writeback_observer.clone(),
+        );
         Ok(Self {
             block_ptr_tree: RwMutex::new(tree),
             npages: AtomicUsize::new(npages),
             fs,
+            metadata_data: AtomicBool::new(false),
+            writeback_observer,
         })
+    }
+
+    pub(super) fn bind_writeback_target(&self, inode: Weak<Inode>) {
+        self.metadata_data.store(
+            inode
+                .upgrade()
+                .is_some_and(|inode| inode.type_ == InodeType::Dir),
+            Ordering::Release,
+        );
+        self.writeback_observer.bind_inode(inode);
     }
 
     /// Returns a strong reference to the owning filesystem.
@@ -182,6 +207,10 @@ impl IndirectManager {
 }
 
 impl BlockAsPageCacheBackend for IndirectManager {
+    fn writeback_observer(&self) -> Option<Arc<dyn PageCacheWritebackObserver>> {
+        Some(self.writeback_observer.clone())
+    }
+
     fn submit_read_bio(
         &self,
         idx: usize,
@@ -197,7 +226,16 @@ impl BlockAsPageCacheBackend for IndirectManager {
         match self.lookup_block(iblock)? {
             Some(bid) => {
                 let fs = self.fs()?;
-                fs.read_blocks_async(Ext4Bid::from(bid), bio_segment, Some(complete_fn), io_batch)
+                if self.metadata_data.load(Ordering::Acquire) {
+                    fs.read_metadata_segment(Ext4Bid::from(bid), bio_segment, complete_fn)
+                } else {
+                    fs.read_blocks_async(
+                        Ext4Bid::from(bid),
+                        bio_segment,
+                        Some(complete_fn),
+                        io_batch,
+                    )
+                }
             }
             None => {
                 // Encountered a hole, zero fill the page.
@@ -224,12 +262,11 @@ impl BlockAsPageCacheBackend for IndirectManager {
         // Buffered writes pre-allocate in `prepare_write`, so the block is
         // usually already mapped; write it directly.
         if let Some(bid) = self.lookup_block(iblock)? {
-            return fs.write_blocks_async(
-                Ext4Bid::from(bid),
-                bio_segment,
-                Some(complete_fn),
-                io_batch,
-            );
+            return if self.metadata_data.load(Ordering::Acquire) {
+                fs.write_metadata_segments(Ext4Bid::from(bid), vec![bio_segment], complete_fn)
+            } else {
+                fs.write_blocks_async(Ext4Bid::from(bid), bio_segment, Some(complete_fn), io_batch)
+            };
         }
 
         // Encountered a hole; allocate a block. Since we dropped the read
@@ -242,7 +279,11 @@ impl BlockAsPageCacheBackend for IndirectManager {
             ResolvedBlockRange::Existing(r) => r.start,
         };
 
-        fs.write_blocks_async(Ext4Bid::from(bid), bio_segment, Some(complete_fn), io_batch)
+        if self.metadata_data.load(Ordering::Acquire) {
+            fs.write_metadata_segments(Ext4Bid::from(bid), vec![bio_segment], complete_fn)
+        } else {
+            fs.write_blocks_async(Ext4Bid::from(bid), bio_segment, Some(complete_fn), io_batch)
+        }
     }
 }
 

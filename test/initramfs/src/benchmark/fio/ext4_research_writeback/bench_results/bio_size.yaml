@@ -1,0 +1,15 @@
+alert:
+  bigger_is_better: true
+  threshold: 125%
+chart:
+  description: Maximum guest EXT4 BIO size after buffered writeback workloads
+  legend: Maximum EXT4 BIO size on {system}
+  title: '[EXT4 research] Maximum writeback BIO size'
+  unit: bytes
+result_extraction:
+  result_index: NF
+  search_pattern: '\[ext4-research\].*max_bio_bytes='
+runtime_config:
+  aster_scheme: null
+  mem: 4G
+  smp: 2

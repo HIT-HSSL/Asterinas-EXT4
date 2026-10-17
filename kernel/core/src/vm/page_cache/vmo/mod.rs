@@ -16,9 +16,10 @@
 //!   direct page-oriented access should work with [`Vmo`].
 
 use core::{
+    borrow::Borrow,
     cmp::min,
     ops::{Deref, Range},
-    sync::atomic::{AtomicIsize, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
 };
 
 use align_ext::AlignExt;
@@ -27,12 +28,15 @@ use ostd::{
     mm::{HasPaddr, io::util::HasVmReaderWriter},
     task::disable_preempt,
 };
-use xarray::{Cursor, LockedXArray, XArray};
+use xarray::{Cursor, LockedXArray, XArray, XMark};
 
 use crate::{
     prelude::*,
     vm::{
-        page_cache::{CachePage, CachePageExt, PageCacheBackend, cache_page::PageState},
+        page_cache::{
+            CachePage, CachePageExt, LockedCachePage, PageCacheBackend, WritebackBatchFence,
+            WritebackBatchResult, WritebackMode, WritebackPage, cache_page::PageState,
+        },
         vmar::Rmap,
     },
 };
@@ -40,6 +44,26 @@ use crate::{
 mod options;
 
 pub(crate) use options::VmoOptions;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PageCacheMark {
+    Dirty,
+    Writeback,
+}
+
+impl From<PageCacheMark> for XMark {
+    fn from(value: PageCacheMark) -> Self {
+        match value {
+            PageCacheMark::Dirty => XMark::Mark0,
+            PageCacheMark::Writeback => XMark::Mark1,
+        }
+    }
+}
+
+pub(super) type PageArray = XArray<CachePage, PageCacheMark>;
+
+/// Maximum number of page snapshots owned by one writeback I/O batch.
+const WRITEBACK_BATCH_PAGES: usize = 1024;
 
 /// Page-indexed memory object used by the page cache and mapping code.
 ///
@@ -122,7 +146,7 @@ pub(crate) struct Vmo {
     /// Flags
     pub(super) flags: VmoFlags,
     /// The virtual pages where the VMO resides.
-    pub(super) pages: XArray<CachePage>,
+    pub(super) pages: PageArray,
     /// The size of the VMO.
     ///
     /// This is the page-aligned VMO size, which may differ from the
@@ -139,6 +163,7 @@ pub(crate) struct Vmo {
     pub(super) writable_mapping_status: WritableMappingStatus,
     /// Reserve mappings.
     pub(super) rmap: Mutex<Rmap>,
+    pub(super) self_ref: SpinLock<Weak<Vmo>>,
 }
 
 impl Debug for Vmo {
@@ -230,12 +255,12 @@ pub(crate) enum VmoMapMode {
 
 impl VmoMapMode {
     /// Ensures that the page can be mapped to a page table.
-    fn ensure(self, page: CachePage) {
+    fn ensure(self, vmo: &Vmo, page_idx: usize, page: CachePage) {
         match page.state() {
             PageState::UpToDate if self.is_write() => {
                 let locked_page = page.lock_guard();
                 if locked_page.state().is_up_to_date() {
-                    locked_page.set_dirty();
+                    vmo.mark_page_dirty(page_idx, &locked_page);
                 }
             }
             PageState::UpToDate | PageState::Dirty => (),
@@ -257,13 +282,18 @@ impl VmoMapMode {
     ///
     /// On success, returns a mode that satisfies `self` but may grant the caller more permissions
     /// when mapping `page`. See also the "Map modes" section in [`Vmo::try_commit_page`].
-    fn try_ensure(self, page_idx: usize, page: &CachePage) -> Result<Self, VmoCommitError> {
+    fn try_ensure(
+        self,
+        vmo: &Vmo,
+        page_idx: usize,
+        page: &CachePage,
+    ) -> Result<Self, VmoCommitError> {
         match page.state() {
             PageState::UpToDate if self.is_write() => {
                 if let Some(locked_page) = page.try_lock_guard()
                     && locked_page.state().is_up_to_date()
                 {
-                    locked_page.set_dirty();
+                    vmo.mark_page_dirty(page_idx, &locked_page);
                     Ok(Self::SharedWrite)
                 } else {
                     Err(VmoCommitError::NeedIo { index: page_idx })
@@ -294,7 +324,7 @@ impl Vmo {
     /// For VMOs with a backend this may perform synchronous I/O.
     pub(crate) fn commit_on(&self, page_idx: usize, map_mode: VmoMapMode) -> Result<()> {
         let page = self.commit_on_internal(page_idx, CommitMode::Read)?;
-        map_mode.ensure(page);
+        map_mode.ensure(self, page_idx, page);
         Ok(())
     }
 
@@ -362,13 +392,13 @@ impl Vmo {
             // `VmoMapMode::try_ensure` checks if the page has been initialized.
             self.try_commit_with_cursor(&mut cursor, CommitMode::Overwrite)?
         };
-        let mode = map_mode.try_ensure(page_idx, &page)?;
+        let mode = map_mode.try_ensure(self, page_idx, &page)?;
         Ok((page, mode))
     }
 
     fn try_commit_with_cursor(
         &self,
-        cursor: &mut Cursor<'_, CachePage>,
+        cursor: &mut Cursor<'_, CachePage, PageCacheMark>,
         commit_mode: CommitMode,
     ) -> Result<(usize, CachePage), VmoCommitError> {
         if let Some(backed_vmo) = self.as_backed_vmo() {
@@ -412,7 +442,7 @@ impl Vmo {
             |commit_fn| {
                 let mut new_commit_fn = || {
                     let (idx, page) = commit_fn()?;
-                    map_mode.try_ensure(idx, &page)?;
+                    map_mode.try_ensure(self, idx, &page)?;
                     Ok((idx, page))
                 };
                 operate(&mut new_commit_fn)
@@ -482,7 +512,7 @@ impl Vmo {
     pub(super) fn decommit_anon_pages(
         &self,
         mut locked_rmap: MutexGuard<Rmap>,
-        mut locked_pages: LockedXArray<CachePage>,
+        mut locked_pages: LockedXArray<CachePage, PageCacheMark>,
         range: Range<usize>,
     ) -> Result<()> {
         debug_assert!(!self.has_backend());
@@ -522,6 +552,34 @@ impl Vmo {
     /// Returns whether this VMO has a backend.
     fn has_backend(&self) -> bool {
         self.backend.is_some()
+    }
+
+    pub(super) fn set_page_mark_if_same(
+        &self,
+        index: usize,
+        expected_page: &CachePage,
+        mark: PageCacheMark,
+    ) -> bool {
+        let mut pages = self.pages.lock();
+        let mut cursor = pages.cursor_mut(index as u64);
+        let is_same_page = cursor
+            .load()
+            .is_some_and(|current_page| current_page.paddr() == expected_page.paddr());
+        is_same_page && cursor.set_mark(mark).is_ok()
+    }
+
+    pub(super) fn unset_page_mark_if_same(
+        &self,
+        index: usize,
+        expected_page: &CachePage,
+        mark: PageCacheMark,
+    ) -> bool {
+        let mut pages = self.pages.lock();
+        let mut cursor = pages.cursor_mut(index as u64);
+        let is_same_page = cursor
+            .load()
+            .is_some_and(|current_page| current_page.paddr() == expected_page.paddr());
+        is_same_page && cursor.unset_mark(mark).is_ok()
     }
 }
 
@@ -740,14 +798,14 @@ impl Vmo {
                     Err((err, written_size)) => {
                         // If the page is not initialized, keep it as it is on a partial write.
                         if written_size > 0 && state.is_up_to_date() {
-                            locked_page.set_dirty();
+                            self.mark_page_dirty(idx, &locked_page);
                         }
                         return Err(Error::from(err));
                     }
                 };
 
                 if written_size > 0 {
-                    locked_page.set_dirty();
+                    self.mark_page_dirty(idx, &locked_page);
                 }
 
                 *page_offset = 0;
@@ -757,6 +815,32 @@ impl Vmo {
         }
 
         Ok(())
+    }
+
+    /// Publishes a dirty-page lookup mark before exposing the dirty page state.
+    fn publish_dirty_mark(&self, index: usize, page: &CachePage) {
+        if let Some(backed_vmo) = self.as_backed_vmo() {
+            backed_vmo.set_page_mark_if_same(index, page, PageCacheMark::Dirty);
+        }
+    }
+
+    fn mark_page_dirty<PageRef: Borrow<CachePage>>(
+        &self,
+        index: usize,
+        page: &LockedCachePage<PageRef>,
+    ) {
+        if page.state().is_dirty() {
+            return;
+        }
+        self.publish_dirty_mark(index, page);
+        let was_outstanding = page.is_writing_back();
+        page.set_dirty();
+        if !was_outstanding
+            && let Some(backed_vmo) = self.as_backed_vmo()
+            && let Some(observer) = backed_vmo.backend.writeback_observer()
+        {
+            observer.page_dirtied(index);
+        }
     }
 
     /// Collects a batch of committed pages from `start_idx` to `end_idx`.
@@ -842,7 +926,6 @@ pub(crate) struct BackedVmo<'a> {
 }
 
 enum PageSelection {
-    Flush,
     Evict,
 }
 
@@ -850,52 +933,147 @@ impl PageSelection {
     fn should_collect(&self, page: &CachePage) -> bool {
         let state = page.state();
         match self {
-            PageSelection::Flush if state.is_dirty() => true,
-            PageSelection::Flush if state.is_uninit() => false,
-            PageSelection::Flush if let Some(locked_page) = page.try_lock_guard() => {
-                locked_page.is_writing_back()
-            }
-            // We need to wait for all the pages that are being written back to finish before
-            // returning from `flush()`. But we don't know whether this page is being writing back
-            // because `try_lock_guard()` fails. So let's be conservative and collect this page.
-            PageSelection::Flush => true,
             PageSelection::Evict => state.is_up_to_date(),
         }
     }
 }
 
 impl<'a> BackedVmo<'a> {
+    /// Returns merged dirty-page byte ranges clipped to `range` and this VMO.
+    #[cfg(ktest)]
+    pub(super) fn dirty_ranges(&self, range: &Range<usize>) -> Vec<Range<usize>> {
+        let end = range.end.min(self.size());
+        if range.start >= end {
+            return Vec::new();
+        }
+
+        let page_idx_range = get_page_idx_range(&(range.start..end));
+        let dirty_pages = self.collect_marked_pages(&page_idx_range, PageCacheMark::Dirty);
+        let Some(&(first_idx, _)) = dirty_pages.first() else {
+            return Vec::new();
+        };
+
+        let mut ranges = Vec::new();
+        let mut run_start = first_idx * PAGE_SIZE;
+        let mut run_end = run_start + PAGE_SIZE;
+        for &(idx, _) in &dirty_pages[1..] {
+            let page_start = idx * PAGE_SIZE;
+            if page_start == run_end {
+                run_end += PAGE_SIZE;
+            } else {
+                ranges.push(run_start.max(range.start)..run_end.min(end));
+                run_start = page_start;
+                run_end = page_start + PAGE_SIZE;
+            }
+        }
+        ranges.push(run_start.max(range.start)..run_end.min(end));
+        ranges
+    }
+
     /// Writes back dirty pages in the specified byte range to the backend storage.
     pub(super) fn flush_dirty_pages(&self, range: &Range<usize>) -> Result<()> {
+        loop {
+            let dispatcher = self.backend.writeback_completion_dispatcher();
+            let completion_progress = dispatcher
+                .as_ref()
+                .map(|dispatcher| dispatcher.completion_progress());
+            match self.flush_dirty_pages_batch(range, WRITEBACK_BATCH_PAGES) {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(error) if error.error() == Errno::EBUSY => {
+                    let (Some(dispatcher), Some(observed)) = (dispatcher, completion_progress)
+                    else {
+                        return Err(error);
+                    };
+                    dispatcher.wait_for_completion_progress_since(observed);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Writes back at most `max_pages` candidates from the specified byte range.
+    ///
+    /// Returns whether this pass observed any dirty or in-flight page. The
+    /// caller repeats bounded passes to preserve full-range flush semantics
+    /// without retaining snapshots for the entire dirty set.
+    pub(super) fn flush_dirty_pages_batch(
+        &self,
+        range: &Range<usize>,
+        max_pages: usize,
+    ) -> Result<bool> {
+        Ok(self
+            .flush_dirty_pages_batch_with_mode(range, max_pages, WritebackMode::Sync)?
+            .had_work())
+    }
+
+    pub(super) fn flush_dirty_pages_batch_with_mode(
+        &self,
+        range: &Range<usize>,
+        max_pages: usize,
+        mode: WritebackMode,
+    ) -> Result<WritebackBatchResult> {
+        assert!(max_pages > 0, "writeback batch must contain pages");
         if range.start >= self.size() {
-            return Ok(());
+            return Ok(WritebackBatchResult::empty());
         }
 
         let mut locked_rmap = self.rmap.lock();
 
         let page_idx_range = get_page_idx_range(range);
-        let pages_to_flush = self.collect_pages_if(&page_idx_range, PageSelection::Flush);
+        let pages_to_flush = self.collect_flush_candidates(&page_idx_range, max_pages);
         if pages_to_flush.is_empty() {
-            return Ok(());
+            return Ok(WritebackBatchResult::empty());
         }
-
         // We must lock and mark all pages as up-to-date before freezing them in the page table. A
         // concurrent page fault caused by a write operation will synchronize via the page table
         // lock. Either the mapped item will be freezed below or the page fault handler will see the
         // page as up to date and be blocked on the page lock.
         let mut locked_dirty_pages = Vec::new();
         let mut maybe_writing_back_pages = Vec::new();
+        let mut blocked_on_writeback = false;
         for (idx, page) in pages_to_flush {
             if !page.state().is_dirty() {
-                maybe_writing_back_pages.push(page);
+                let locked_page = page.lock();
+                if locked_page.is_writing_back() {
+                    blocked_on_writeback = true;
+                    maybe_writing_back_pages.push(locked_page.unlock());
+                } else {
+                    self.unset_page_mark_if_same(idx, &locked_page, PageCacheMark::Writeback);
+                }
                 continue;
             }
-            let locked_page = page.lock();
+            let mut locked_page = page.lock();
             if locked_page.state().is_dirty() {
+                // A previous writeback may still own the page-local flag. Keep
+                // Dirty visible until that generation has completed.
+                if locked_page.is_writing_back() {
+                    let page = locked_page.unlock();
+                    if matches!(mode, WritebackMode::Background) {
+                        blocked_on_writeback = true;
+                        maybe_writing_back_pages.push(page);
+                        continue;
+                    }
+                    page.wait_until_finish_writing_back();
+                    locked_page = page.lock();
+                    if !locked_page.state().is_dirty() {
+                        self.unset_page_mark_if_same(idx, &locked_page, PageCacheMark::Writeback);
+                        continue;
+                    }
+                }
+                if !self.set_page_mark_if_same(idx, &locked_page, PageCacheMark::Writeback) {
+                    continue;
+                }
+                self.unset_page_mark_if_same(idx, &locked_page, PageCacheMark::Dirty);
                 locked_page.set_up_to_date();
                 locked_dirty_pages.push((idx, locked_page));
             } else if locked_page.is_writing_back() {
+                blocked_on_writeback = true;
                 maybe_writing_back_pages.push(locked_page.unlock());
+            } else {
+                // A completion may have raced candidate collection. Remove a
+                // stale secondary-index entry after rechecking under the page lock.
+                self.unset_page_mark_if_same(idx, &locked_page, PageCacheMark::Writeback);
             }
         }
 
@@ -904,20 +1082,130 @@ impl<'a> BackedVmo<'a> {
         // As long as the pages are locked and their state is `UpToDate`, no one can write to them.
         // Therefore, we can release the reverse-mapping lock now.
         drop(locked_rmap);
-
         let mut io_batch = IoBatch::with_capacity(locked_dirty_pages.len());
-        for (idx, locked_page) in locked_dirty_pages {
-            self.backend
-                .write_page_async(idx, locked_page, &mut io_batch)?;
+        let observer = self.backend.writeback_observer();
+        let dispatcher = self.backend.writeback_completion_dispatcher();
+        let detached = dispatcher.is_some();
+        let batch_fence = detached.then(WritebackBatchFence::new);
+        let writeback_pages: Vec<_> = locked_dirty_pages
+            .into_iter()
+            .map(|(idx, locked_page)| {
+                let mut page = WritebackPage::new(idx, locked_page, observer.clone());
+                page.bind_vmo(self.self_ref.lock().upgrade().unwrap());
+                if let Some(batch_fence) = batch_fence.as_ref() {
+                    page.bind_batch_fence(batch_fence.clone());
+                }
+                if let Some(dispatcher) = dispatcher.as_ref() {
+                    page.bind_dispatcher(dispatcher.clone());
+                }
+                page
+            })
+            .collect();
+        if writeback_pages.is_empty() && matches!(mode, WritebackMode::Background) {
+            return Ok(if blocked_on_writeback {
+                WritebackBatchResult::blocked_on_writeback()
+            } else {
+                WritebackBatchResult::empty()
+            });
         }
-        io_batch.wait_all()?;
+        let submitted_pages: Vec<_> = writeback_pages
+            .iter()
+            .map(|page| {
+                (
+                    page.index(),
+                    page.locked_page.deref().clone(),
+                    page.claim_handle(),
+                )
+            })
+            .collect();
+        let submit_result = self
+            .backend
+            .write_pages_async(writeback_pages, &mut io_batch);
+        let writeback_result = if detached {
+            submit_result
+        } else {
+            submit_result.and(io_batch.wait_all().map_err(Error::from))
+        };
+        if !detached || writeback_result.is_err() {
+            self.finish_writeback_marks(&submitted_pages);
+        }
+        writeback_result?;
 
-        for page in maybe_writing_back_pages {
-            let locked_page = page.lock();
-            locked_page.wait_until_finish_writing_back();
+        let submitted_fence = batch_fence.and_then(|batch_fence| batch_fence.sequence());
+        if matches!(mode, WritebackMode::Sync) {
+            if let Some(dispatcher) = dispatcher.as_ref()
+                && let Some(sequence) = dispatcher.latest_sequence()
+            {
+                // Drive completions already registered before this sync. Keep
+                // any error persistent until the final fence consumes it.
+                let _ = dispatcher.wait_through(sequence);
+            }
+            for page in maybe_writing_back_pages {
+                page.wait_until_finish_writing_back();
+            }
+            if let Some(dispatcher) = dispatcher {
+                // A background submitter exposes Writeback before registering its
+                // completion sequence. Waiting for the observed pages first and
+                // sampling the fence afterwards closes that registration window.
+                let observed_fence = dispatcher.latest_sequence();
+                let fence = match (observed_fence, submitted_fence) {
+                    (Some(observed), Some(submitted)) => Some(observed.max(submitted)),
+                    (observed, submitted) => observed.or(submitted),
+                };
+                WritebackBatchResult::detached(dispatcher, fence).wait_and_consume_error()?;
+            }
+            return Ok(WritebackBatchResult::completed());
         }
 
-        Ok(())
+        let result = if let Some(dispatcher) = dispatcher {
+            WritebackBatchResult::detached(dispatcher, submitted_fence)
+        } else {
+            WritebackBatchResult::completed()
+        };
+        Ok(result)
+    }
+
+    fn collect_flush_candidates(
+        &self,
+        page_idx_range: &Range<usize>,
+        max_pages: usize,
+    ) -> Vec<(usize, CachePage)> {
+        let mut pages =
+            self.collect_marked_pages_limited(page_idx_range, PageCacheMark::Dirty, max_pages);
+        if pages.len() < max_pages {
+            pages.extend(self.collect_marked_pages_limited(
+                page_idx_range,
+                PageCacheMark::Writeback,
+                max_pages - pages.len(),
+            ));
+        }
+        pages.sort_unstable_by_key(|(idx, _)| *idx);
+        pages.dedup_by_key(|(idx, _)| *idx);
+        pages
+    }
+
+    fn finish_writeback_marks(&self, pages: &[(usize, CachePage, Arc<AtomicBool>)]) {
+        for (idx, page, claimed) in pages {
+            let locked_page = page.lock_guard();
+
+            // Another flush may already have waited for this I/O and started a
+            // newer generation. Its Writeback mark must remain intact.
+            if locked_page.is_writing_back() {
+                continue;
+            }
+
+            if !claimed.load(Ordering::Acquire) {
+                self.set_page_mark_if_same(*idx, &locked_page, PageCacheMark::Dirty);
+                // The candidate was already charged when it first became
+                // dirty. A backend may fail before taking page-local
+                // writeback ownership, so rollback must not publish a second
+                // dirty event for the same outstanding page.
+                locked_page.set_dirty();
+            } else if locked_page.state().is_dirty() {
+                self.set_page_mark_if_same(*idx, &locked_page, PageCacheMark::Dirty);
+            }
+            self.unset_page_mark_if_same(*idx, &locked_page, PageCacheMark::Writeback);
+        }
     }
 
     /// Removes up-to-date (clean) pages in the specified byte range from the page cache.
@@ -964,7 +1252,7 @@ impl<'a> BackedVmo<'a> {
         drop(locked_rmap);
 
         for (idx, page) in locked_up_to_date_pages {
-            page.wait_until_finish_writing_back();
+            let page = page.wait_until_finish_writing_back();
             let mut locked_pages = self.pages.lock();
             let mut cursor_mut = locked_pages.cursor_mut(idx as u64);
             let removed_page = cursor_mut.remove();
@@ -989,7 +1277,7 @@ impl<'a> BackedVmo<'a> {
     pub(super) fn decommit_pages(
         &self,
         mut locked_rmap: MutexGuard<Rmap>,
-        locked_pages: LockedXArray<CachePage>,
+        locked_pages: LockedXArray<CachePage, PageCacheMark>,
         range: &Range<usize>,
     ) -> Result<()> {
         // Do not check `self.size()` here. It contains the new size, however, we want to decommit
@@ -1008,9 +1296,14 @@ impl<'a> BackedVmo<'a> {
 
         drop(locked_rmap);
 
-        for (_, page) in removed_pages {
-            let locked_page = page.lock();
-            locked_page.wait_until_finish_writing_back();
+        let observer = self.backend.writeback_observer();
+        for (idx, page) in removed_pages {
+            let locked_page = page.lock().wait_until_finish_writing_back();
+            if locked_page.state().is_dirty()
+                && let Some(observer) = observer.as_ref()
+            {
+                observer.page_cleaned(idx);
+            }
         }
 
         Ok(())
@@ -1055,7 +1348,7 @@ impl<'a> BackedVmo<'a> {
     /// Attempts to commit a page using a cursor, without blocking on I/O.
     fn try_commit_with_cursor(
         &self,
-        cursor: &mut Cursor<'_, CachePage>,
+        cursor: &mut Cursor<'_, CachePage, PageCacheMark>,
         commit_mode: CommitMode,
     ) -> Result<(usize, CachePage), VmoCommitError> {
         let page_idx = cursor.index() as usize;
@@ -1112,10 +1405,74 @@ impl<'a> BackedVmo<'a> {
         collected_pages
     }
 
+    pub(super) fn set_page_mark_if_same(
+        &self,
+        index: usize,
+        expected_page: &CachePage,
+        mark: PageCacheMark,
+    ) -> bool {
+        self.vmo.set_page_mark_if_same(index, expected_page, mark)
+    }
+
+    pub(super) fn unset_page_mark_if_same(
+        &self,
+        index: usize,
+        expected_page: &CachePage,
+        mark: PageCacheMark,
+    ) -> bool {
+        self.vmo.unset_page_mark_if_same(index, expected_page, mark)
+    }
+
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) fn collect_marked_pages(
+        &self,
+        page_idx_range: &Range<usize>,
+        mark: PageCacheMark,
+    ) -> Vec<(usize, CachePage)> {
+        self.collect_marked_pages_limited(page_idx_range, mark, usize::MAX)
+    }
+
+    fn collect_marked_pages_limited(
+        &self,
+        page_idx_range: &Range<usize>,
+        mark: PageCacheMark,
+        limit: usize,
+    ) -> Vec<(usize, CachePage)> {
+        if page_idx_range.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+
+        let mut collected_pages = Vec::new();
+        let preempt_guard = disable_preempt();
+        let mut cursor = self
+            .pages
+            .cursor(&preempt_guard, page_idx_range.start as u64);
+
+        if cursor.is_marked(mark)
+            && let Some(page) = cursor.load()
+        {
+            collected_pages.push((page_idx_range.start, page.clone()));
+        }
+
+        while collected_pages.len() < limit
+            && let Some(index) = cursor.next_marked(mark)
+        {
+            let index = index as usize;
+            if index >= page_idx_range.end {
+                break;
+            }
+            if let Some(page) = cursor.load() {
+                collected_pages.push((index, page.clone()));
+            }
+        }
+
+        collected_pages
+    }
+
     /// Removes pages in the specified page index range.
     fn remove_pages_in(
         &self,
-        mut locked_pages: LockedXArray<CachePage>,
+        mut locked_pages: LockedXArray<CachePage, PageCacheMark>,
         page_idx_range: &Range<usize>,
     ) -> Vec<(usize, CachePage)> {
         if page_idx_range.is_empty() {

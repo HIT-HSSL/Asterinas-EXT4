@@ -386,6 +386,10 @@ impl SuperBlock {
         self.feature_incompat
     }
 
+    pub(super) fn set_incompat_feature(&mut self, feature: FeatureIncompatSet, enabled: bool) {
+        self.feature_incompat.set(feature, enabled);
+    }
+
     #[expect(dead_code)]
     pub(super) const fn feature_ro_compat(&self) -> FeatureRoCompatSet {
         self.feature_ro_compat
@@ -510,3 +514,5 @@ impl Default for Reserved {
         Self([0u32; 190])
     }
 }
+
+impl crate::fs::fs_impls::ext4::nv::persistent::Sealed for RawSuperBlock {}

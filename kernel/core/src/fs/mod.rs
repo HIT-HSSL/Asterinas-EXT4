@@ -3,6 +3,7 @@
 pub(crate) mod file;
 mod fs_impls;
 pub(crate) mod initramfs;
+pub(crate) mod nv_pool;
 pub(crate) mod pipe;
 pub(crate) mod rootfs;
 pub(crate) mod thread_info;
@@ -26,6 +27,7 @@ use crate::{
 };
 
 pub(crate) fn init() {
+    nv_pool::init();
     vfs::init();
     fs_impls::init();
 }

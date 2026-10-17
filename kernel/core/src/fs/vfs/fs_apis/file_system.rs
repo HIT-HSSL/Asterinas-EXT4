@@ -21,6 +21,11 @@ pub(crate) trait FileSystem: Any + Sync + Send {
     /// Syncs the file system.
     fn sync(&self) -> Result<()>;
 
+    /// Performs a clean-unmount drain after ordinary synchronization.
+    fn drain(&self) -> Result<()> {
+        self.sync()
+    }
+
     /// Returns the root inode of this file system.
     ///
     /// For each mount, the VFS invokes this method only once and eagerly when

@@ -3,8 +3,9 @@
 //! Ext4 filesystem implementation.
 //!
 //! The implementation supports extent-based and ext2-style indirect file I/O,
-//! linear directories, special files, and extended attributes. Journaling,
-//! metadata checksums, and indexed directories are not supported yet.
+//! linear directories, special files, and extended attributes. The ext4
+//! flavor also supports the runtime JBD2 subset implemented in [`journal`].
+//! Metadata checksums and indexed directories are not supported yet.
 
 // Set this module's log prefix for `ostd::log`.
 macro_rules! __log_prefix {
@@ -20,14 +21,23 @@ pub(in crate::fs) use self::fs_type::{EXT2_TYPE, EXT4_TYPE};
 use crate::fs::vfs::registry;
 
 mod block_group;
+mod buddy_cache;
+mod extent_mutation_anchor;
 mod feature;
 mod fs;
 mod fs_type;
 mod impl_for_vfs;
 mod inode;
+mod journal;
+mod metadata_cache;
+mod nv;
 mod prelude;
+mod references;
+mod rename_anchor;
+mod stats;
 mod super_block;
 mod utils;
+mod writeback;
 mod xattr;
 
 #[cfg(ktest)]

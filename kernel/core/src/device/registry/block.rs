@@ -2,11 +2,14 @@
 
 use alloc::borrow::ToOwned;
 
-use aster_block::{BLOCK_SIZE, BlockDevice, SECTOR_SIZE};
+use aster_block::{BLOCK_SIZE, BlockDevice, SECTOR_SIZE, bio::BioStatus};
 use aster_nvme::NvmeBlockDevice;
 use aster_virtio::device::block::device::BlockDevice as VirtIoBlockDevice;
 use device_id::DeviceId;
-use ostd::mm::VmIo;
+use ostd::{
+    cpu::{CpuId, num_cpus},
+    mm::VmIo,
+};
 
 use crate::{
     context::current_userspace,
@@ -14,7 +17,7 @@ use crate::{
     events::IoEvents,
     fs::{
         devtmpfs::{self, DevtmpfsNode, DevtmpfsNodeMeta},
-        file::{PerOpenFileOps, SettableStatusFlags, StatusFlags},
+        file::{PerOpenFileOps, SettableStatusFlags, StatusFlags, SyncMode},
         vfs::{inode::FileOps, path::Path},
     },
     prelude::*,
@@ -30,16 +33,33 @@ pub(super) fn init_in_first_kthread() {
         }
 
         // Spawn threads for virtio block devices
-        if device.downcast_ref::<VirtIoBlockDevice>().is_some() {
-            let device_clone = device.clone();
-            let task_fn = move || {
-                info!("spawn the virtio-block thread");
-                let virtio_block_device = device_clone.downcast_ref::<VirtIoBlockDevice>().unwrap();
-                loop {
-                    virtio_block_device.handle_requests();
-                }
-            };
-            ThreadOptions::new(task_fn).spawn();
+        if let Some(virtio_device) = device.downcast_ref::<VirtIoBlockDevice>() {
+            for queue_index in 0..virtio_device.queue_count() {
+                let device_clone = device.clone();
+                let task_fn = move || {
+                    info!("spawn virtio-block queue {} thread", queue_index);
+                    let virtio_block_device =
+                        device_clone.downcast_ref::<VirtIoBlockDevice>().unwrap();
+                    loop {
+                        virtio_block_device.handle_requests(queue_index);
+                    }
+                };
+                let cpu = CpuId::try_from(queue_index % num_cpus()).unwrap();
+                ThreadOptions::new(task_fn).cpu_affinity(cpu.into()).spawn();
+
+                let device_clone = device.clone();
+                let completion_fn = move || {
+                    info!("spawn virtio-block queue {} completion thread", queue_index);
+                    let virtio_block_device =
+                        device_clone.downcast_ref::<VirtIoBlockDevice>().unwrap();
+                    loop {
+                        virtio_block_device.handle_completions(queue_index);
+                    }
+                };
+                ThreadOptions::new(completion_fn)
+                    .cpu_affinity(cpu.into())
+                    .spawn();
+            }
         }
         // Spawn threads for NVMe block devices
         else if device.downcast_ref::<NvmeBlockDevice>().is_some() {
@@ -242,6 +262,18 @@ impl PerOpenFileOps for OpenBlockFile {
 
     fn settable_status_flags(&self) -> SettableStatusFlags {
         SettableStatusFlags::minimal().with_o_direct()
+    }
+
+    fn sync(&self, _mode: SyncMode) -> Result<()> {
+        match self.0.sync()? {
+            // Linux treats an unsupported block-device flush as success.
+            // Reference: <https://github.com/torvalds/linux/blob/v6.16/block/fops.c#L609-L611>
+            BioStatus::Complete | BioStatus::NotSupported => Ok(()),
+            status @ (BioStatus::NoSpace | BioStatus::IoError) => Err(status.into()),
+            BioStatus::Init | BioStatus::Submit | BioStatus::Zeros => {
+                return_errno_with_message!(Errno::EIO, "invalid block device flush status")
+            }
+        }
     }
 }
 

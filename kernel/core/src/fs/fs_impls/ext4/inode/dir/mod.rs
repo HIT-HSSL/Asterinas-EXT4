@@ -15,7 +15,12 @@ use ostd::sync::RwMutexWriteGuard;
 
 use self::dir_entry::DirEntryFileType;
 use super::{
-    super::{prelude::*, utils},
+    super::{
+        fs::Ext4,
+        prelude::*,
+        rename_anchor::{RenameAnchor, UNKNOWN_RENAME_SLOT},
+        utils,
+    },
     FileFlags, FilePerm, Inode, InodeInner, MAX_LINK_COUNT,
 };
 
@@ -47,7 +52,153 @@ struct DirEntryInfo {
     entry_rec_len: usize,
 }
 
+struct ReclaimInodeCollector(Vec<Ext4Ino>);
+
+/// Converges an interrupted NV-backed rename before the filesystem is exposed.
+pub(in crate::fs::fs_impls::ext4) fn recover_rename(
+    fs: &Arc<Ext4>,
+    anchor: RenameAnchor,
+) -> Result<()> {
+    if anchor.dst_slot == UNKNOWN_RENAME_SLOT {
+        return_errno_with_message!(Errno::EIO, "rename anchor has no destination slot");
+    }
+    let src_slot = usize::try_from(anchor.src_slot).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+    let dst_slot = usize::try_from(anchor.dst_slot).map_err(|_| Error::new(Errno::EOVERFLOW))?;
+    let src = fs.read_inode(anchor.src_dir)?;
+    let dst = fs.read_inode(anchor.dst_dir)?;
+    let moved = fs.read_inode(anchor.ino)?;
+    let replaced = (anchor.replaced_ino != 0)
+        .then(|| fs.read_inode(anchor.replaced_ino))
+        .transpose()?;
+    let mut guards = MultiInodeInnerGuards::lock(&[
+        src.as_ref(),
+        dst.as_ref(),
+        moved.as_ref(),
+        replaced.as_deref().unwrap_or(moved.as_ref()),
+    ]);
+
+    let source_is_old = guards
+        .inner(anchor.src_dir)
+        .entry_info_at(src_slot)?
+        .is_some_and(|entry| entry.ino == anchor.ino);
+    let destination = guards.inner(anchor.dst_dir).entry_info_at(dst_slot)?;
+    let destination_is_new = destination.is_some_and(|entry| entry.ino == anchor.ino);
+
+    if source_is_old {
+        // The old name is still authoritative. Undo a possibly published
+        // destination and restore exact pre-rename link counts.
+        if destination_is_new {
+            let destination = destination.expect("checked above");
+            if let Some(replaced) = &replaced {
+                guards.inner_mut(anchor.dst_dir).set_entry_target(
+                    &destination,
+                    replaced.ino(),
+                    DirEntryFileType::from(replaced.inode_type()),
+                )?;
+            } else {
+                guards
+                    .inner_mut(anchor.dst_dir)
+                    .delete_entry(&destination)?;
+            }
+        }
+        guards
+            .inner_mut(anchor.src_dir)
+            .set_link_count(anchor.src_links_before);
+        guards
+            .inner_mut(anchor.dst_dir)
+            .set_link_count(anchor.dst_links_before);
+        guards
+            .inner_mut(anchor.ino)
+            .set_link_count(anchor.ino_links_before);
+        if let Some(replaced) = &replaced {
+            guards
+                .inner_mut(replaced.ino())
+                .set_link_count(anchor.replaced_links_before);
+        }
+        if moved.inode_type() == InodeType::Dir && anchor.src_dir != anchor.dst_dir {
+            let dotdot = guards.inner(anchor.ino).find_entry_info("..")?;
+            guards.inner_mut(anchor.ino).set_entry_target(
+                &dotdot,
+                anchor.src_dir,
+                DirEntryFileType::Dir,
+            )?;
+        }
+    } else {
+        // Source deletion is the commit point. The destination must already be
+        // durable; finish all dependent metadata idempotently.
+        if !destination_is_new {
+            return_errno_with_message!(
+                Errno::EIO,
+                "interrupted rename has neither old nor new namespace entry"
+            );
+        }
+        guards
+            .inner_mut(anchor.src_dir)
+            .set_link_count(anchor.src_links_after);
+        guards
+            .inner_mut(anchor.dst_dir)
+            .set_link_count(anchor.dst_links_after);
+        guards
+            .inner_mut(anchor.ino)
+            .set_link_count(anchor.ino_links_after);
+        if let Some(replaced) = &replaced {
+            guards
+                .inner_mut(replaced.ino())
+                .set_link_count(anchor.replaced_links_after);
+        }
+        if moved.inode_type() == InodeType::Dir && anchor.src_dir != anchor.dst_dir {
+            let dotdot = guards.inner(anchor.ino).find_entry_info("..")?;
+            guards.inner_mut(anchor.ino).set_entry_target(
+                &dotdot,
+                anchor.dst_dir,
+                DirEntryFileType::Dir,
+            )?;
+        }
+    }
+
+    guards.inner_mut(anchor.src_dir).sync_data_pages()?;
+    if anchor.src_dir != anchor.dst_dir {
+        guards.inner_mut(anchor.dst_dir).sync_data_pages()?;
+    }
+    if moved.inode_type() == InodeType::Dir
+        && anchor.ino != anchor.src_dir
+        && anchor.ino != anchor.dst_dir
+    {
+        guards.inner_mut(anchor.ino).sync_data_pages()?;
+    }
+    fs.sync_metadata()?;
+    let mut inos = vec![anchor.src_dir, anchor.dst_dir, anchor.ino];
+    if anchor.replaced_ino != 0 {
+        inos.push(anchor.replaced_ino);
+    }
+    inos.sort_unstable();
+    inos.dedup();
+    for ino in inos {
+        guards.inner_mut(ino).write_back_inode_desc(fs, ino)?;
+    }
+    fs.clear_rename_anchor()
+}
+
+impl DirentVisitor for ReclaimInodeCollector {
+    fn visit(&mut self, name: &str, ino: u64, _type: InodeType, _offset: usize) -> Result<()> {
+        if name != "." && name != ".." && ino != 0 {
+            self.0
+                .push(u32::try_from(ino).map_err(|_| Error::new(Errno::EOVERFLOW))?);
+        }
+        Ok(())
+    }
+}
+
 impl Inode {
+    pub(in ext4) fn reclaim_directory_children(&self) -> Result<Vec<Ext4Ino>> {
+        if self.type_ != InodeType::Dir {
+            return Ok(Vec::new());
+        }
+        let mut collector = ReclaimInodeCollector(Vec::new());
+        self.inner.read().readdir_at(0, &mut collector)?;
+        Ok(collector.0)
+    }
+
     /// Looks up a child entry by name and reads its inode.
     pub(in ext4) fn lookup(&self, name: &str) -> Result<Arc<Inode>> {
         let ino = self.inner.read().find_entry_ino(name)?;
@@ -75,24 +226,18 @@ impl Inode {
 
     /// Removes an empty sub-directory.
     ///
-    /// The same `child`-before-`guards` drop ordering as
-    /// [`unlink`](Self::unlink) is required here.
-    pub(in ext4) fn rmdir(&self, name: &str) -> Result<()> {
-        let entry_info = {
-            let parent_inner = self.inner.read();
-            parent_inner.find_entry_info(name)?
-        };
+    pub(in ext4) fn rmdir(&self, name: &str, child: &Inode) -> Result<()> {
         let fs = self.fs()?;
-
-        // CRITICAL drop ordering: `child` declared before `guards` so the multi-
-        // inode lock is released before `child` drops and its `Drop` reclaim
-        // re-takes `child.inner.write()`. See `unlink` for the full rationale.
-        let child = fs.read_inode(entry_info.ino)?;
 
         // The `DirDentry.children` lock in the VFS layer keeps the parent
         // directory entry stable during this operation, so we only need to lock
         // all related inodes in order, without rechecking the lookup result.
-        let mut guards = MultiInodeInnerGuards::lock(&[self, child.as_ref()]);
+        let mut guards = MultiInodeInnerGuards::lock(&[self, child]);
+
+        let entry_info = guards.inner(self.ino()).find_entry_info(name)?;
+        if entry_info.ino != child.ino() {
+            return_errno_with_message!(Errno::EIO, "directory entry changed during rmdir");
+        }
 
         let child_inner = guards.inner_mut(child.ino());
         if child_inner.inode_type() != InodeType::Dir {
@@ -106,8 +251,8 @@ impl Inode {
         // The child loses its own `.` self-link and the parent's directory entry.
         child_inner.dec_link_count(2);
         if child_inner.link_count() == 0 {
-            child_inner.write_back_inode_desc(&fs, entry_info.ino)?;
-            let _ = fs.remove_inode(entry_info.ino);
+            child_inner.write_back_inode_desc(&fs, child.ino())?;
+            let _ = fs.remove_inode(child.ino());
         }
 
         let parent_inner = guards.inner_mut(self.ino());
@@ -198,6 +343,7 @@ impl Inode {
     /// `Inode::link`. The two inodes (`self` and `old`) are locked through
     /// [`MultiInodeInnerGuards`] in ino order.
     pub(in ext4) fn link(&self, old: &Inode, name: &str) -> Result<()> {
+        let fs = self.fs()?;
         let dir_entry_file_type = DirEntryFileType::from(old.inode_type());
         let mut guards = MultiInodeInnerGuards::lock(&[self, old]);
 
@@ -216,6 +362,7 @@ impl Inode {
         let old_inner = guards.inner_mut(old.ino());
         old_inner.set_ctime(utils::now());
         old_inner.inc_link_count(1);
+        old_inner.write_back_inode_desc(&fs, old.ino())?;
         Ok(())
     }
 
@@ -223,46 +370,43 @@ impl Inode {
     ///
     /// On the link count reaching zero, the inode is dropped from the cache and
     /// reclaimed by the last surviving `Arc`.
-    pub(in ext4) fn unlink(&self, name: &str) -> Result<()> {
-        let entry_info = {
-            let parent_inner = self.inner.read();
-            parent_inner.find_entry_info(name)?
-        };
+    pub(in ext4) fn unlink(&self, name: &str, child: &Inode) -> Result<()> {
         let fs = self.fs()?;
-
-        // CRITICAL drop ordering: `child` is declared *before*
-        // `guards`, so at scope end Rust drops `guards` first (reverse
-        // declaration order), releasing `child.inner.write()` before `child`
-        // itself drops. If `child` is the last `Arc` (no fd holds it open) its
-        // `Drop` runs `try_reclaim_deleted_inode`, which takes
-        // `child.inner.write()`; were the guard still held this would self-
-        // deadlock. Do NOT reorder these two locals.
-        let child = fs.read_inode(entry_info.ino)?;
 
         // The `DirDentry.children` lock in the VFS layer keeps the parent
         // directory entry stable during this operation, so we only need to lock
         // all related inodes in order, without rechecking the lookup result.
-        let mut guards = MultiInodeInnerGuards::lock(&[self, child.as_ref()]);
+        let mut guards = MultiInodeInnerGuards::lock(&[self, child]);
+
+        let entry_info = guards.inner(self.ino()).find_entry_info(name)?;
+        if entry_info.ino != child.ino() {
+            return_errno_with_message!(Errno::EIO, "directory entry changed during unlink");
+        }
 
         let child_inner = guards.inner_mut(child.ino());
         if child_inner.inode_type() == InodeType::Dir {
             return_errno!(Errno::EISDIR);
         }
 
-        let parent_inner = guards.inner_mut(self.ino());
-        parent_inner.delete_entry(&entry_info)?;
-        parent_inner.set_mtime_ctime(utils::now());
+        {
+            let parent_inner = guards.inner_mut(self.ino());
+            parent_inner.delete_entry(&entry_info)?;
+            parent_inner.set_mtime_ctime(utils::now());
+            if fs.uses_nv_pool() {
+                parent_inner.sync_data_pages()?;
+            }
+        }
 
         // Update timestamps before dropping the target link count.
         let child_inner = guards.inner_mut(child.ino());
         child_inner.set_ctime(utils::now());
         child_inner.dec_link_count(1);
         if child_inner.link_count() == 0 {
-            child_inner.write_back_inode_desc(&fs, entry_info.ino)?;
+            child_inner.write_back_inode_desc(&fs, child.ino())?;
             // Drop the cache's `Arc`; if an fd still holds one the inode stays
             // alive until that last `Arc` drops, then `Drop` reclaims it. We do
             // NOT force reclaim here — refcount + `Drop` handle unlink-of-open.
-            let _ = fs.remove_inode(entry_info.ino);
+            let _ = fs.remove_inode(child.ino());
         }
         Ok(())
     }
@@ -288,6 +432,82 @@ impl Inode {
 
         self.validate_rename_invariants(&guards, old_inode, replaced_inode)?;
 
+        let fs = self.fs()?;
+        if fs.uses_nv_pool() {
+            let old_is_dir = old_inode.inode_type() == InodeType::Dir;
+            let same_dir = self.ino() == new_dir_inode.ino();
+            let src_links_before = guards.inner(self.ino()).link_count();
+            let dst_links_before = guards.inner(new_dir_inode.ino()).link_count();
+            let ino_links = guards.inner(old_inode.ino()).link_count();
+            let replaced_links_before = replaced_inode
+                .map(|inode| guards.inner(inode.ino()).link_count())
+                .unwrap_or(0);
+            let subtract = |value: u16, delta: u16| {
+                value
+                    .checked_sub(delta)
+                    .ok_or_else(|| Error::with_message(Errno::EIO, "rename link count underflow"))
+            };
+            let (src_links_after, dst_links_after) = if same_dir {
+                let after = if old_is_dir && replaced_inode.is_some() {
+                    subtract(src_links_before, 1)?
+                } else {
+                    src_links_before
+                };
+                (after, after)
+            } else {
+                let src_after = if old_is_dir {
+                    subtract(src_links_before, 1)?
+                } else {
+                    src_links_before
+                };
+                let dst_after = if old_is_dir && replaced_inode.is_none() {
+                    dst_links_before.checked_add(1).ok_or_else(|| {
+                        Error::with_message(Errno::EMLINK, "rename link count overflow")
+                    })?
+                } else {
+                    dst_links_before
+                };
+                (src_after, dst_after)
+            };
+            let replaced_links_after = if replaced_inode.is_some() {
+                subtract(replaced_links_before, if old_is_dir { 2 } else { 1 })?
+            } else {
+                0
+            };
+            let src_slot = guards
+                .inner(self.ino())
+                .find_entry_info(old_name)?
+                .dir_offset;
+            let dst_slot = if replaced_inode.is_some() {
+                Some(
+                    guards
+                        .inner(new_dir_inode.ino())
+                        .find_entry_info(new_name)?
+                        .dir_offset,
+                )
+            } else {
+                let target_inner = guards.inner(new_dir_inode.ino());
+                Some(
+                    target_inner
+                        .find_dir_slot(new_name.len())?
+                        .map(|slot| slot.dir_offset + slot.used_rec_len)
+                        .unwrap_or_else(|| target_inner.file_size()),
+                )
+            };
+            fs.commit_rename_anchor(&RenameAnchor::new(
+                self.ino(),
+                src_slot,
+                new_dir_inode.ino(),
+                dst_slot,
+                old_inode.ino(),
+                replaced_inode.map(Inode::ino),
+                (src_links_before, src_links_after),
+                (dst_links_before, dst_links_after),
+                (ino_links, ino_links),
+                (replaced_links_before, replaced_links_after),
+            )?)?;
+        }
+
         self.apply_dir_mutations(
             &mut guards,
             new_dir_inode,
@@ -296,6 +516,36 @@ impl Inode {
             replaced_inode,
             new_name,
         )?;
+
+        if fs.uses_nv_pool() {
+            // Publish the new name first; a crash can temporarily leave both
+            // names, but never loses the inode from the namespace.
+            guards.inner_mut(new_dir_inode.ino()).sync_data_pages()?;
+            if self.ino() != new_dir_inode.ino() {
+                guards.inner_mut(self.ino()).sync_data_pages()?;
+            }
+            if old_inode.inode_type() == InodeType::Dir
+                && old_inode.ino() != self.ino()
+                && old_inode.ino() != new_dir_inode.ino()
+            {
+                guards.inner_mut(old_inode.ino()).sync_data_pages()?;
+            }
+
+            // Directory-page writeback may have allocated blocks. Their
+            // allocation bits must be durable before publishing inode roots.
+            fs.sync_metadata()?;
+
+            let mut inos = vec![self.ino(), new_dir_inode.ino(), old_inode.ino()];
+            if let Some(replaced) = replaced_inode {
+                inos.push(replaced.ino());
+            }
+            inos.sort_unstable();
+            inos.dedup();
+            for ino in inos {
+                guards.inner_mut(ino).write_back_inode_desc(&fs, ino)?;
+            }
+            fs.clear_rename_anchor()?;
+        }
 
         Ok(())
     }
@@ -367,6 +617,11 @@ impl Inode {
             } else {
                 dir_inner.add_new_entry(new_name, old_ino, moved_file_type)?;
             }
+            if fs.uses_nv_pool() {
+                dir_inner.sync_data_pages()?;
+                fs.sync_metadata()?;
+                dir_inner.write_back_inode_desc(&fs, self.ino())?;
+            }
             // Re-read the source entry: `add_new_entry` may have split it
             // (shrinking its `rec_len`), making any earlier `DirEntryInfo` stale.
             let old_info = dir_inner.find_entry_info(old_name)?;
@@ -391,6 +646,11 @@ impl Inode {
                 target_inner.inc_link_count(1);
             }
             target_inner.set_mtime_ctime(utils::now());
+            if fs.uses_nv_pool() {
+                target_inner.sync_data_pages()?;
+                fs.sync_metadata()?;
+                target_inner.write_back_inode_desc(&fs, target.ino())?;
+            }
 
             let source_inner = guards.inner_mut(self.ino());
             // Re-read the source entry (same staleness reason as above, though
@@ -511,12 +771,35 @@ mod test {
         super::super::test_utils::{Ext4Fixture, Ext4FixtureBuilder, make_empty_file_inode},
         *,
     };
-    use crate::time::clocks;
+    use crate::{
+        fs::{
+            fs_impls::ext4::{fs::ROOT_INO, rename_anchor::RENAME_ANCHOR_HOME},
+            nv_pool::{
+                config::{NvPoolConfig, NvSimMode},
+                dram::DramNvBackend,
+                frame::NvPool,
+            },
+        },
+        time::clocks,
+    };
 
     const DIR_INO: u32 = 12;
 
     fn perm() -> FilePerm {
         FilePerm::from_bits_truncate(0o644)
+    }
+
+    fn nv_pool() -> Arc<NvPool> {
+        let config = NvPoolConfig::from_bytes(
+            Some(64 * PAGE_SIZE),
+            Some(64 * PAGE_SIZE),
+            Some(0),
+            Some(NvSimMode::Fast),
+        )
+        .unwrap()
+        .unwrap();
+        let backend = Arc::new(DramNvBackend::allocate(config).unwrap());
+        Arc::new(NvPool::format(backend, config, None).unwrap())
     }
 
     /// A fixture whose block *and* inode bitmaps are marked, with a `.`/`..`
@@ -541,6 +824,211 @@ mod test {
         f
     }
 
+    #[ktest]
+    fn directory_page_is_committed_as_nv_metadata_before_ssd() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_reserved_inode(DIR_INO)
+            .with_nv_pool(nv_pool())
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755;
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        dir.inner.write().make_empty(DIR_INO, 2).unwrap();
+        let pblock = dir
+            .inner
+            .read()
+            .block_manager()
+            .unwrap()
+            .map_blocks(0)
+            .unwrap()
+            .pblock()
+            .unwrap();
+
+        dir.sync_all().unwrap();
+
+        let mut ssd = [0; BLOCK_SIZE];
+        f.disk
+            .segment()
+            .read_bytes(pblock as usize * BLOCK_SIZE, &mut ssd)
+            .unwrap();
+        assert_eq!(ssd, [0; BLOCK_SIZE]);
+        let mut nv = [0; BLOCK_SIZE];
+        f.ext4
+            .nv_state()
+            .unwrap()
+            .read_meta_block(pblock)
+            .unwrap()
+            .read(&mut nv)
+            .unwrap();
+        assert_eq!(u32::from_ne_bytes(nv[0..4].try_into().unwrap()), DIR_INO);
+        assert_eq!(dir.lookup(".").unwrap().ino(), DIR_INO);
+    }
+
+    #[ktest]
+    fn rename_commits_namespace_and_clears_anchor() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_reserved_inode(DIR_INO)
+            .with_nv_pool(nv_pool())
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755;
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        dir.inner.write().make_empty(DIR_INO, 2).unwrap();
+        dir.sync_all().unwrap();
+        let child = dir.create("old", InodeType::File, perm()).unwrap();
+        dir.sync_all().unwrap();
+
+        dir.rename("old", &child, &dir, "new", None).unwrap();
+
+        assert!(dir.lookup("old").is_err());
+        assert_eq!(dir.lookup("new").unwrap().ino(), child.ino());
+        assert!(
+            f.ext4
+                .nv_state()
+                .unwrap()
+                .resident_frame(RENAME_ANCHOR_HOME)
+                .is_none()
+        );
+    }
+
+    fn prepare_interrupted_rename() -> (Ext4Fixture, Arc<Inode>, Arc<Inode>, RenameAnchor) {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_reserved_inode(DIR_INO)
+            .with_nv_pool(nv_pool())
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755;
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        dir.inner.write().make_empty(DIR_INO, 2).unwrap();
+        let child = dir.create("old", InodeType::File, perm()).unwrap();
+        let inner = dir.inner.read();
+        let src_slot = inner.find_entry_info("old").unwrap().dir_offset;
+        let slot = inner.find_dir_slot("new".len()).unwrap().unwrap();
+        let dst_slot = slot.dir_offset + slot.used_rec_len;
+        drop(inner);
+        let anchor = RenameAnchor::new(
+            DIR_INO,
+            src_slot,
+            DIR_INO,
+            Some(dst_slot),
+            child.ino(),
+            None,
+            (dir.link_count(), dir.link_count()),
+            (dir.link_count(), dir.link_count()),
+            (child.link_count(), child.link_count()),
+            (0, 0),
+        )
+        .unwrap();
+        anchor.persist(f.ext4.nv_state().unwrap()).unwrap();
+        (f, dir, child, anchor)
+    }
+
+    #[ktest]
+    fn rename_recovery_rolls_back_when_source_entry_remains() {
+        let (f, dir, child, anchor) = prepare_interrupted_rename();
+        dir.inner
+            .write()
+            .add_new_entry(
+                "new",
+                child.ino(),
+                DirEntryFileType::from(child.inode_type()),
+            )
+            .unwrap();
+
+        recover_rename(&f.ext4, anchor).unwrap();
+
+        assert_eq!(dir.lookup("old").unwrap().ino(), child.ino());
+        assert!(dir.lookup("new").is_err());
+        assert!(
+            f.ext4
+                .nv_state()
+                .unwrap()
+                .resident_frame(RENAME_ANCHOR_HOME)
+                .is_none()
+        );
+    }
+
+    #[ktest]
+    fn rename_recovery_finishes_when_source_entry_is_gone() {
+        let (f, dir, child, anchor) = prepare_interrupted_rename();
+        {
+            let mut inner = dir.inner.write();
+            inner
+                .add_new_entry(
+                    "new",
+                    child.ino(),
+                    DirEntryFileType::from(child.inode_type()),
+                )
+                .unwrap();
+            let old = inner.find_entry_info("old").unwrap();
+            inner.delete_entry(&old).unwrap();
+        }
+
+        recover_rename(&f.ext4, anchor).unwrap();
+
+        assert!(dir.lookup("old").is_err());
+        assert_eq!(dir.lookup("new").unwrap().ino(), child.ino());
+        assert!(
+            f.ext4
+                .nv_state()
+                .unwrap()
+                .resident_frame(RENAME_ANCHOR_HOME)
+                .is_none()
+        );
+    }
+
+    #[ktest]
+    fn reclaim_frees_unreachable_inode_but_preserves_namespace_tree() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_reserved_inode(ROOT_INO)
+            .with_nv_pool(nv_pool())
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755;
+        raw.link_count = 2;
+        f.write_raw_inode(ROOT_INO, &raw);
+        let root = f.ext4.read_inode(ROOT_INO).unwrap();
+        root.inner.write().make_empty(ROOT_INO, ROOT_INO).unwrap();
+        root.sync_all().unwrap();
+        let reachable = root.create("kept", InodeType::File, perm()).unwrap();
+        root.sync_all().unwrap();
+
+        let orphan = f
+            .ext4
+            .create_inode(ROOT_INO, InodeType::File, perm())
+            .unwrap();
+        let orphan_ino = orphan.ino();
+        drop(orphan);
+
+        let stats = f.ext4.reclaim_unreachable().unwrap();
+
+        assert_eq!(stats.reclaimed_inodes, 1);
+        assert_eq!(root.lookup("kept").unwrap().ino(), reachable.ino());
+        assert!(!f.ext4.block_group(0).is_inode_allocated(orphan_ino));
+    }
+
     /// Unlink-of-open: while an `Arc` to the child is held, `unlink` removes the
     /// name but does NOT free the inode (it stays allocated). Dropping the held
     /// `Arc` then reclaims it via `Drop`, restoring the free counts. This is the
@@ -559,7 +1047,7 @@ mod test {
         let mut reader = VmReader::from(&[3u8; 32][..]).to_fallible();
         open.write_at(0, &mut reader).unwrap();
 
-        dir.unlink("open.txt").unwrap();
+        dir.unlink("open.txt", open.as_ref()).unwrap();
 
         // Name gone, but the inode is still allocated: an fd holds it open.
         assert!(dir.lookup("open.txt").is_err());

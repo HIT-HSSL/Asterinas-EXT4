@@ -22,7 +22,7 @@ use ostd::mm::io::util::HasVmReaderWriter;
 use super::{
     super::{fs::Ext4, prelude::*, utils},
     Inode, InodeInner,
-    block_mapping::{MapState, Mapping},
+    block_mapping::{BufferedWriteReservation, MapState, Mapping, extent::node::TierBlock},
 };
 use crate::fs::vfs::inode::FallocMode;
 
@@ -51,8 +51,38 @@ impl Inode {
         if reader.remain() == 0 {
             return Ok(0);
         }
-        let mut inner = self.inner.write();
-        inner.write_at(offset, reader)
+        offset
+            .checked_add(reader.remain())
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
+        let fs = self.fs()?;
+        let mut written = 0usize;
+        let chunk_bytes = fs.writeback_controller().write_chunk_bytes();
+        while reader.has_remain() {
+            fs.writeback_controller().balance_dirty_pages()?;
+            let chunk_len = reader.remain().min(chunk_bytes);
+            let mut chunk_reader = reader.clone();
+            chunk_reader.limit(chunk_len);
+            let result = self
+                .inner
+                .write()
+                .write_at(offset + written, &mut chunk_reader);
+            match result {
+                Ok(chunk_written) => {
+                    debug_assert_eq!(chunk_written, chunk_len);
+                    if chunk_written == 0 {
+                        return Ok(written);
+                    }
+                    reader.skip(chunk_written);
+                    written += chunk_written;
+                }
+                Err(err) if written == 0 => return Err(err),
+                Err(_) => return Ok(written),
+            }
+            if fs.writeback_controller().balance_dirty_pages().is_err() {
+                return Ok(written);
+            }
+        }
+        Ok(written)
     }
 
     /// Direct-I/O read path.
@@ -71,7 +101,9 @@ impl Inode {
         }
 
         let fs = self.fs()?;
-        let read_len = self.inner.read().read_direct_at(&fs, offset, writer)?;
+        let read_len = fs
+            .writeback_controller()
+            .with_submission_allowed(|| self.inner.read().read_direct_at(&fs, offset, writer))?;
         if read_len > 0 {
             self.set_atime(utils::now());
         }
@@ -183,6 +215,22 @@ impl InodeInner {
             .ensure_allocated(start_block, end_block)
     }
 
+    fn prepare_buffered_write(
+        &mut self,
+        offset: usize,
+        end: usize,
+    ) -> Result<BufferedWriteReservation> {
+        let old_size = self.file_size();
+        if end > old_size {
+            self.ensure_size_within_limit(end)?;
+            self.resize_page_cache(end, old_size)?;
+        }
+        let start_block = (offset / BLOCK_SIZE) as Iblock;
+        let end_block = end.div_ceil(BLOCK_SIZE) as Iblock;
+        self.block_manager()?
+            .prepare_buffered_write(start_block, end_block)
+    }
+
     /// Restores page-cache capacity and frees blocks allocated past `old_size`
     /// after a failed write.
     pub(super) fn rollback_write(&mut self, old_size: usize, end: usize) {
@@ -237,11 +285,17 @@ impl InodeInner {
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
         let old_size = self.file_size();
 
-        if let Err(err) = self.prepare_write(offset, end) {
-            self.rollback_write(old_size, end);
-            return Err(err);
-        }
+        let reservation = match self.prepare_buffered_write(offset, end) {
+            Ok(reservation) => reservation,
+            Err(err) => {
+                self.rollback_write(old_size, end);
+                return Err(err);
+            }
+        };
         if let Err(err) = self.page_cache()?.write(offset, reader) {
+            if let Ok(block_manager) = self.block_manager() {
+                block_manager.cancel_buffered_write(reservation);
+            }
             self.rollback_write(old_size, end);
             return Err(err.into());
         }
@@ -286,16 +340,16 @@ impl InodeInner {
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
         let old_size = self.file_size();
 
-        if let Err(err) = self.prepare_write(offset, end) {
-            self.rollback_write(old_size, end);
-            return Err(err);
-        }
-
         let discard_start_bytes = offset.min(old_size);
         let discard_end_bytes = end.min(old_size);
         if discard_start_bytes < discard_end_bytes {
             self.page_cache()?
                 .invalidate_range(discard_start_bytes..discard_end_bytes)?;
+        }
+
+        if let Err(err) = self.prepare_write(offset, end) {
+            self.rollback_write(old_size, end);
+            return Err(err);
         }
 
         if let Err(err) = self.write_direct_blocks(fs, offset, reader) {
@@ -331,7 +385,12 @@ impl InodeInner {
             if mapping.reads_as_zeros() {
                 writer.fill_zeros(run_len as usize * BLOCK_SIZE)?;
             } else {
-                let pblock = mapping.pblock().expect("a written mapping has blocks");
+                let Some(TierBlock::Ssd(pblock)) = mapping.tier_block() else {
+                    return_errno_with_message!(
+                        Errno::EOPNOTSUPP,
+                        "direct I/O on an NV-tier extent is not supported"
+                    );
+                };
                 let bio_segment = BioSegment::alloc(run_len as usize, BioDirection::FromDevice);
                 fs.read_blocks(pblock, bio_segment.clone())?;
                 bio_segment.reader()?.read_fallible(writer)?;
@@ -367,6 +426,12 @@ impl InodeInner {
                 // so holes here indicate a bug. Stale-read is not a concern
                 // because our inode-level lock serializes reads after this write.
                 return_errno_with_message!(Errno::EIO, "unexpected hole in direct write path");
+            };
+            let TierBlock::Ssd(pblock) = TierBlock::decode(pblock)? else {
+                return_errno_with_message!(
+                    Errno::EOPNOTSUPP,
+                    "direct I/O on an NV-tier extent is not supported"
+                );
             };
             if state == MapState::Unwritten {
                 // `prepare_write` allocates in written state (and converts any
@@ -409,7 +474,7 @@ impl InodeInner {
 
     /// Shrinks the file: zeroes the kept partial last block in the page cache,
     /// frees every data/metadata block past `new_size`, then publishes the size.
-    fn shrink(&mut self, new_size: usize) -> Result<()> {
+    pub(super) fn shrink(&mut self, new_size: usize) -> Result<()> {
         let old_size = self.file_size();
         // Shrink the VMO before publishing the smaller size.
         // `PageCache::resize` zeroes `[new_size, block_end)` of the
@@ -462,10 +527,28 @@ fn is_block_aligned(offset: usize) -> bool {
 #[cfg(ktest)]
 mod tests {
     use aster_block::BLOCK_SIZE;
-    use ostd::prelude::ktest;
+    use ostd::{mm::VmIo, prelude::ktest};
 
-    use super::super::super::test_utils::{Ext4Fixture, Ext4FixtureBuilder, make_empty_file_inode};
-    use crate::{fs::vfs::inode::FallocMode, prelude::*, time::clocks};
+    use super::{
+        super::super::test_utils::{Ext4Fixture, Ext4FixtureBuilder, make_empty_file_inode},
+        MapState,
+    };
+    use crate::{
+        fs::{
+            fs_impls::ext4::{
+                fs::{Ext4, MountFlavor},
+                inode::block_mapping::extent::node::TierBlock,
+            },
+            nv_pool::{
+                config::{NvPoolConfig, NvSimMode},
+                dram::DramNvBackend,
+                frame::NvPool,
+            },
+            vfs::{file_system::FsFlags, inode::FallocMode},
+        },
+        prelude::*,
+        time::clocks,
+    };
 
     const FILE_INO: u32 = 11;
 
@@ -481,6 +564,279 @@ mod tests {
         f
     }
 
+    fn nv_pool() -> Arc<NvPool> {
+        let config = NvPoolConfig::from_bytes(
+            Some(128 * PAGE_SIZE),
+            Some(64 * PAGE_SIZE),
+            Some(64 * PAGE_SIZE),
+            Some(NvSimMode::Fast),
+        )
+        .unwrap()
+        .unwrap();
+        let backend = Arc::new(DramNvBackend::allocate(config).unwrap());
+        Arc::new(NvPool::format(backend, config, None).unwrap())
+    }
+
+    #[ktest]
+    fn fsync_publishes_nv_extent_and_clean_drain_restores_ssd_extent() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_free_blocks(8)
+            .with_reserved_inode(FILE_INO)
+            .with_nv_pool(nv_pool())
+            .build()
+            .unwrap();
+        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        let data = vec![0xa5; BLOCK_SIZE];
+        inode
+            .write_at(0, &mut VmReader::from(data.as_slice()).to_fallible())
+            .unwrap();
+
+        inode.sync_data().unwrap();
+
+        let mapping = inode
+            .inner
+            .read()
+            .block_manager()
+            .unwrap()
+            .map_blocks(0)
+            .unwrap();
+        let TierBlock::Nv(page) = mapping.tier_block().unwrap() else {
+            panic!("fsync did not publish an NV extent")
+        };
+        let target = f.ext4.nv_state().unwrap().data_page_target(page).unwrap();
+        let mut direct_read = vec![0; BLOCK_SIZE];
+        assert_eq!(
+            inode
+                .read_direct_at(
+                    0,
+                    &mut VmWriter::from(direct_read.as_mut_slice()).to_fallible(),
+                )
+                .unwrap_err()
+                .error(),
+            Errno::EOPNOTSUPP
+        );
+        assert_eq!(
+            inode
+                .write_direct_at(
+                    0,
+                    &mut VmReader::from(vec![0x5c; BLOCK_SIZE].as_slice()).to_fallible(),
+                )
+                .unwrap_err()
+                .error(),
+            Errno::EOPNOTSUPP
+        );
+        let err = match Ext4::open(f.disk.clone(), FsFlags::empty(), MountFlavor::Ext4, None) {
+            Ok(_) => panic!("NV-tier volume mounted without the nvpool option"),
+            Err(err) => err,
+        };
+        assert_eq!(err.error(), Errno::EINVAL);
+
+        f.ext4.drain_nv_data().unwrap();
+        f.ext4.nv_state().unwrap().drain_all_metadata().unwrap();
+        f.ext4.finish_nv_drain().unwrap();
+
+        let mapping = inode
+            .inner
+            .read()
+            .block_manager()
+            .unwrap()
+            .map_blocks(0)
+            .unwrap();
+        assert_eq!(mapping.tier_block(), Some(TierBlock::Ssd(target)));
+        let mut ssd = vec![0; BLOCK_SIZE];
+        f.disk
+            .segment()
+            .read_bytes(target as usize * BLOCK_SIZE, &mut ssd)
+            .unwrap();
+        assert_eq!(ssd, data);
+        assert!(Ext4::open(f.disk.clone(), FsFlags::empty(), MountFlavor::Ext4, None).is_ok());
+        assert_eq!(
+            f.ext4
+                .nv_state()
+                .unwrap()
+                .data_page_target(page)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+    }
+
+    #[ktest]
+    fn fsync_overwrite_replaces_and_releases_old_nv_page() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_free_blocks(8)
+            .with_reserved_inode(FILE_INO)
+            .with_nv_pool(nv_pool())
+            .build()
+            .unwrap();
+        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let first_data = vec![0x31; BLOCK_SIZE];
+        inode
+            .write_at(0, &mut VmReader::from(first_data.as_slice()).to_fallible())
+            .unwrap();
+        inode.sync_data().unwrap();
+        let first_mapping = inode
+            .inner
+            .read()
+            .block_manager()
+            .unwrap()
+            .map_blocks(0)
+            .unwrap();
+        let TierBlock::Nv(first_page) = first_mapping.tier_block().unwrap() else {
+            panic!("first fsync did not publish an NV extent")
+        };
+        let target = f
+            .ext4
+            .nv_state()
+            .unwrap()
+            .data_page_target(first_page)
+            .unwrap();
+
+        let overwrite_offset = 137;
+        let overwrite = vec![0x72; 500];
+        let mut expected = first_data.clone();
+        expected[overwrite_offset..overwrite_offset + overwrite.len()].copy_from_slice(&overwrite);
+        inode
+            .write_at(
+                overwrite_offset,
+                &mut VmReader::from(overwrite.as_slice()).to_fallible(),
+            )
+            .unwrap();
+        inode.sync_data().unwrap();
+        let second_mapping = inode
+            .inner
+            .read()
+            .block_manager()
+            .unwrap()
+            .map_blocks(0)
+            .unwrap();
+        let TierBlock::Nv(second_page) = second_mapping.tier_block().unwrap() else {
+            panic!("overwrite fsync did not publish an NV extent")
+        };
+
+        assert_ne!(first_page, second_page);
+        assert_eq!(
+            f.ext4
+                .nv_state()
+                .unwrap()
+                .data_page_target(second_page)
+                .unwrap(),
+            target
+        );
+        assert_eq!(
+            f.ext4
+                .nv_state()
+                .unwrap()
+                .data_page_target(first_page)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+        let mut readback = vec![0; BLOCK_SIZE];
+        inode
+            .read_at(
+                0,
+                &mut VmWriter::from(readback.as_mut_slice()).to_fallible(),
+            )
+            .unwrap();
+        assert_eq!(readback, expected);
+    }
+
+    #[ktest]
+    fn nvpool_fsync_does_not_flush_ssd_after_tier_guard_is_durable() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_free_blocks(8)
+            .with_reserved_inode(FILE_INO)
+            .with_nv_pool(nv_pool())
+            .build()
+            .unwrap();
+        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        inode
+            .write_at(
+                0,
+                &mut VmReader::from(vec![0x41; BLOCK_SIZE].as_slice()).to_fallible(),
+            )
+            .unwrap();
+        inode.sync_data().unwrap();
+        let flushes_after_guard = f.disk.flush_count();
+        assert!(flushes_after_guard > 0);
+
+        inode
+            .write_at(
+                0,
+                &mut VmReader::from(vec![0x52; BLOCK_SIZE].as_slice()).to_fallible(),
+            )
+            .unwrap();
+        inode.sync_data().unwrap();
+
+        assert_eq!(f.disk.flush_count(), flushes_after_guard);
+    }
+
+    #[ktest]
+    fn nvpool_filesystem_sync_does_not_flush_ssd() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_free_blocks(8)
+            .with_reserved_inode(FILE_INO)
+            .with_nv_pool(nv_pool())
+            .build()
+            .unwrap();
+        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        inode
+            .write_at(
+                0,
+                &mut VmReader::from(vec![0x63; BLOCK_SIZE].as_slice()).to_fallible(),
+            )
+            .unwrap();
+        inode.sync_data().unwrap();
+        let flushes_after_guard = f.disk.flush_count();
+
+        crate::fs::vfs::file_system::FileSystem::sync(f.ext4.as_ref()).unwrap();
+
+        assert_eq!(f.disk.flush_count(), flushes_after_guard);
+    }
+
+    #[ktest]
+    fn truncate_defers_block_reuse_until_new_inode_root_commits() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_free_blocks(8)
+            .with_reserved_inode(FILE_INO)
+            .with_nv_pool(nv_pool())
+            .build()
+            .unwrap();
+        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        let data = vec![0x71; 2 * BLOCK_SIZE];
+        inode
+            .write_at(0, &mut VmReader::from(data.as_slice()).to_fallible())
+            .unwrap();
+        inode.sync_data().unwrap();
+        let allocated_free_count = f.ext4.super_block().free_blocks_count();
+
+        inode.resize(0).unwrap();
+        assert_eq!(
+            f.ext4.super_block().free_blocks_count(),
+            allocated_free_count,
+            "truncate exposed blocks for reuse before inode commit"
+        );
+
+        inode.sync_data().unwrap();
+        assert_eq!(
+            f.ext4.super_block().free_blocks_count(),
+            allocated_free_count + 2
+        );
+    }
+
     /// A buffered write that runs out of space midway rolls back cleanly: the
     /// file size, the free-block count, and the already-written data are all
     /// left as they were before the failing write.
@@ -494,6 +850,7 @@ mod tests {
         let base_data = vec![0x44u8; BLOCK_SIZE];
         let mut reader = VmReader::from(base_data.as_slice()).to_fallible();
         assert_eq!(inode.write_at(0, &mut reader).unwrap(), BLOCK_SIZE);
+        inode.sync_data().unwrap();
         let free_before_fail = f.ext4.super_block().free_blocks_count();
         assert_eq!(free_before_fail, 1);
 
@@ -517,6 +874,247 @@ mod tests {
         let mut writer = VmWriter::from(readback.as_mut_slice()).to_fallible();
         inode.read_at(0, &mut writer).unwrap();
         assert_eq!(readback, base_data);
+    }
+
+    #[ktest]
+    fn buffered_write_reserves_without_allocating_and_does_not_double_reserve() {
+        let f = fixture_with_free_blocks(2);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        let free_before = f.ext4.super_block().free_blocks_count();
+
+        let data = vec![0x31u8; BLOCK_SIZE];
+        let mut first = VmReader::from(data.as_slice()).to_fallible();
+        assert_eq!(inode.write_at(0, &mut first).unwrap(), BLOCK_SIZE);
+        assert_eq!(f.ext4.super_block().free_blocks_count(), free_before);
+        assert_eq!(f.ext4.reserved_data_blocks(), 1);
+
+        let mut overwrite = VmReader::from(data.as_slice()).to_fallible();
+        assert_eq!(inode.write_at(0, &mut overwrite).unwrap(), BLOCK_SIZE);
+        assert_eq!(f.ext4.super_block().free_blocks_count(), free_before);
+        assert_eq!(f.ext4.reserved_data_blocks(), 1);
+
+        let two_blocks = vec![0x42u8; BLOCK_SIZE * 2];
+        let mut no_space = VmReader::from(two_blocks.as_slice()).to_fallible();
+        assert_eq!(
+            inode
+                .write_at(BLOCK_SIZE, &mut no_space)
+                .unwrap_err()
+                .error(),
+            Errno::ENOSPC
+        );
+        assert_eq!(inode.file_size(), BLOCK_SIZE);
+        assert_eq!(f.ext4.super_block().free_blocks_count(), free_before);
+        assert_eq!(f.ext4.reserved_data_blocks(), 1);
+    }
+
+    #[ktest]
+    fn buffered_write_and_sync_update_mount_dirty_accounting() {
+        let f = fixture_with_free_blocks(2);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        let data = vec![0x6bu8; BLOCK_SIZE];
+        let mut reader = VmReader::from(data.as_slice()).to_fallible();
+
+        inode.write_at(0, &mut reader).unwrap();
+        assert_eq!(f.ext4.writeback_controller().outstanding_pages(), 1);
+
+        inode.sync_data().unwrap();
+        assert_eq!(f.ext4.writeback_controller().outstanding_pages(), 0);
+    }
+
+    #[ktest]
+    fn writeback_queue_keeps_the_exact_dirty_inode_object() {
+        let f = fixture_with_free_blocks(2);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        let data = vec![0x6bu8; BLOCK_SIZE];
+        let mut reader = VmReader::from(data.as_slice()).to_fallible();
+
+        inode.write_at(0, &mut reader).unwrap();
+        f.ext4.remove_inode(FILE_INO);
+
+        let queued = f.ext4.writeback_controller().pop_dirty_inode().unwrap();
+        assert!(Arc::ptr_eq(&queued, &inode));
+    }
+
+    #[ktest]
+    fn nodelalloc_buffered_write_allocates_before_returning() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_free_blocks(2)
+            .with_mount_options("nodelalloc")
+            .build()
+            .unwrap();
+        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        let free_before = f.ext4.super_block().free_blocks_count();
+        let data = vec![0x37u8; BLOCK_SIZE];
+        let mut reader = VmReader::from(data.as_slice()).to_fallible();
+
+        assert_eq!(inode.write_at(0, &mut reader).unwrap(), BLOCK_SIZE);
+        assert_eq!(f.ext4.reserved_data_blocks(), 0);
+        assert_eq!(f.ext4.super_block().free_blocks_count(), free_before - 1);
+        let inner = inode.inner.read();
+        assert_eq!(
+            inner
+                .block_manager()
+                .unwrap()
+                .map_blocks(0)
+                .unwrap()
+                .state(),
+            Some(MapState::Written)
+        );
+    }
+
+    #[ktest]
+    fn fsync_materializes_delayed_extent_and_commits_written_state() {
+        let f = fixture_with_free_blocks(4);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        let free_before = f.ext4.super_block().free_blocks_count();
+        let data = vec![0x5au8; BLOCK_SIZE * 2];
+        let mut reader = VmReader::from(data.as_slice()).to_fallible();
+
+        inode.write_at(0, &mut reader).unwrap();
+        assert_eq!(f.ext4.reserved_data_blocks(), 2);
+        assert_eq!(f.ext4.super_block().free_blocks_count(), free_before);
+
+        inode.sync_data().unwrap();
+        assert_eq!(f.ext4.reserved_data_blocks(), 0);
+        assert_eq!(f.ext4.super_block().free_blocks_count(), free_before - 2);
+        let inner = inode.inner.read();
+        let mapping = inner.block_manager().unwrap().map_blocks(0).unwrap();
+        assert_eq!(mapping.state(), Some(MapState::Written));
+        drop(inner);
+
+        let mut readback = vec![0u8; data.len()];
+        let mut writer = VmWriter::from(readback.as_mut_slice()).to_fallible();
+        inode.read_at(0, &mut writer).unwrap();
+        assert_eq!(readback, data);
+    }
+
+    #[ktest]
+    fn fsync_persists_delalloc_block_bitmap_before_returning() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        let data = vec![0x5au8; BLOCK_SIZE];
+        let mut reader = VmReader::from(data.as_slice()).to_fallible();
+        let scanned_before = f.ext4.io_stats().snapshot().scanned_groups;
+
+        inode.write_at(0, &mut reader).unwrap();
+        inode.sync_data().unwrap();
+
+        assert_eq!(
+            f.ext4.io_stats().snapshot().scanned_groups - scanned_before,
+            1
+        );
+
+        let pblock = inode
+            .inner
+            .read()
+            .block_manager()
+            .unwrap()
+            .map_blocks(0)
+            .unwrap()
+            .pblock()
+            .unwrap() as usize;
+        let mut bitmap_byte = [0u8; 1];
+        f.disk
+            .segment()
+            .read_bytes(2 * BLOCK_SIZE + pblock / 8, &mut bitmap_byte)
+            .unwrap();
+        assert_ne!(bitmap_byte[0] & (1 << (pblock % 8)), 0);
+    }
+
+    #[ktest]
+    fn mapped_overwrite_fsync_does_not_scan_block_groups() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let first = vec![0x31u8; BLOCK_SIZE];
+        inode
+            .write_at(0, &mut VmReader::from(first.as_slice()).to_fallible())
+            .unwrap();
+        inode.sync_data().unwrap();
+
+        let scanned_before = f.ext4.io_stats().snapshot().scanned_groups;
+        let overwrite = vec![0x72u8; BLOCK_SIZE];
+        inode
+            .write_at(0, &mut VmReader::from(overwrite.as_slice()).to_fallible())
+            .unwrap();
+        inode.sync_data().unwrap();
+
+        assert_eq!(
+            f.ext4.io_stats().snapshot().scanned_groups - scanned_before,
+            0
+        );
+    }
+
+    #[ktest]
+    fn failed_delayed_writeback_remains_retryable() {
+        let f = fixture_with_free_blocks(4);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        let data = vec![0x6bu8; BLOCK_SIZE];
+        let mut reader = VmReader::from(data.as_slice()).to_fallible();
+        inode.write_at(0, &mut reader).unwrap();
+
+        f.disk.set_fail_writes(true);
+        assert_eq!(inode.sync_data().unwrap_err().error(), Errno::EIO);
+        assert_eq!(f.ext4.reserved_data_blocks(), 0);
+        let inner = inode.inner.read();
+        assert_eq!(
+            inner
+                .block_manager()
+                .unwrap()
+                .map_blocks(0)
+                .unwrap()
+                .state(),
+            Some(MapState::Unwritten)
+        );
+        drop(inner);
+
+        f.disk.set_fail_writes(false);
+        inode.sync_data().unwrap();
+        f.ext4.writeback_controller().balance_dirty_pages().unwrap();
+        let inner = inode.inner.read();
+        assert_eq!(
+            inner
+                .block_manager()
+                .unwrap()
+                .map_blocks(0)
+                .unwrap()
+                .state(),
+            Some(MapState::Written)
+        );
+    }
+
+    #[ktest]
+    fn truncate_releases_only_discarded_delayed_reservations() {
+        let f = fixture_with_free_blocks(8);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        let data = vec![0x29u8; BLOCK_SIZE * 4];
+        let mut reader = VmReader::from(data.as_slice()).to_fallible();
+
+        inode.write_at(0, &mut reader).unwrap();
+        assert_eq!(f.ext4.reserved_data_blocks(), 4);
+
+        inode.resize(BLOCK_SIZE * 2).unwrap();
+        assert_eq!(inode.file_size(), BLOCK_SIZE * 2);
+        assert_eq!(f.ext4.reserved_data_blocks(), 2);
+
+        inode.sync_data().unwrap();
+        assert_eq!(f.ext4.reserved_data_blocks(), 0);
+        let mut readback = vec![0u8; BLOCK_SIZE * 2];
+        let mut writer = VmWriter::from(readback.as_mut_slice()).to_fallible();
+        inode.read_at(0, &mut writer).unwrap();
+        assert_eq!(readback, data[..BLOCK_SIZE * 2]);
     }
 
     /// `fallocate(Allocate)` that exhausts the volume returns ENOSPC without

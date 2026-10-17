@@ -9,13 +9,21 @@
 //! layer adds none, so the cross-layer lock order documented in
 //! [`super`] is unchanged.
 
-use super::{super::prelude::*, InodeDesc, RAW_BLOCK_PTRS_LEN, empty_extent_root};
+use core::ops::Range;
 
-mod extent;
+use super::{super::prelude::*, Inode, InodeDesc, RAW_BLOCK_PTRS_LEN, empty_extent_root};
+
+pub(in crate::fs::fs_impls::ext4) mod extent;
+#[cfg_attr(not(ktest), expect(dead_code))]
+mod extent_status;
 mod indirect;
 
-use self::{extent::ExtentManager, indirect::IndirectManager};
+use self::{
+    extent::{ExtentManager, node::TierBlock},
+    indirect::IndirectManager,
+};
 use super::super::fs::Ext4;
+use crate::vm::page_cache::PageCacheWritebackObserver;
 
 /// State of an allocated logical block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,21 +51,33 @@ pub(super) enum Mapping {
     },
     /// A run with no physical allocation.
     Hole { len: u32 },
+    /// A dirty page-cache run with reserved but not yet allocated blocks.
+    Delayed { len: u32 },
 }
 
 impl Mapping {
     /// Returns the starting physical block for an allocated run.
-    pub(super) const fn pblock(&self) -> Option<Ext4Bid> {
+    pub(super) fn pblock(&self) -> Option<Ext4Bid> {
         match self {
-            Self::Mapped { pblock, .. } => Some(*pblock),
-            Self::Hole { .. } => None,
+            Self::Mapped { pblock, .. } => match TierBlock::decode(*pblock) {
+                Ok(TierBlock::Ssd(block)) => Some(block),
+                _ => None,
+            },
+            Self::Hole { .. } | Self::Delayed { .. } => None,
+        }
+    }
+
+    pub(super) fn tier_block(&self) -> Option<TierBlock> {
+        match self {
+            Self::Mapped { pblock, .. } => TierBlock::decode(*pblock).ok(),
+            Self::Hole { .. } | Self::Delayed { .. } => None,
         }
     }
 
     /// Returns the number of contiguous logical blocks this mapping describes.
     pub(super) const fn len(&self) -> u32 {
         match self {
-            Self::Mapped { len, .. } | Self::Hole { len } => *len,
+            Self::Mapped { len, .. } | Self::Hole { len } | Self::Delayed { len } => *len,
         }
     }
 
@@ -65,7 +85,7 @@ impl Mapping {
     pub(super) const fn state(&self) -> Option<MapState> {
         match self {
             Self::Mapped { state, .. } => Some(*state),
-            Self::Hole { .. } => None,
+            Self::Hole { .. } | Self::Delayed { .. } => None,
         }
     }
 
@@ -74,6 +94,7 @@ impl Mapping {
         matches!(
             self,
             Self::Hole { .. }
+                | Self::Delayed { .. }
                 | Self::Mapped {
                     state: MapState::Unwritten,
                     ..
@@ -94,24 +115,40 @@ pub(super) enum BlockMapping {
     Indirect(IndirectManager),
 }
 
+#[derive(Default)]
+pub(super) struct BufferedWriteReservation {
+    delayed_ranges: Vec<Range<Iblock>>,
+}
+
 impl BlockMapping {
     /// Builds the mapping engine for a data-backed inode from its descriptor.
-    pub(super) fn new(desc: &InodeDesc, fs: Weak<Ext4>, npages: usize) -> Result<Self> {
+    pub(super) fn new(
+        ino: Ext4Ino,
+        desc: &InodeDesc,
+        fs: Weak<Ext4>,
+        npages: usize,
+    ) -> Result<Self> {
         let root = *desc.raw_block();
         let sector_count = desc.sector_count();
         if desc.is_extent_based() {
-            let manager = ExtentManager::new(root, sector_count, fs, npages)?;
+            let manager = ExtentManager::new(ino, root, sector_count, fs, npages)?;
             Ok(Self::Extent(manager))
         } else {
-            let manager = IndirectManager::new(root, sector_count, fs, npages)?;
+            let manager = IndirectManager::new(ino, root, sector_count, fs, npages)?;
             Ok(Self::Indirect(manager))
         }
     }
 
     /// Builds an empty mapping in the volume's native format.
-    pub(super) fn new_empty(fs: Weak<Ext4>, extent_based: bool, npages: usize) -> Result<Self> {
+    pub(super) fn new_empty(
+        ino: Ext4Ino,
+        fs: Weak<Ext4>,
+        extent_based: bool,
+        npages: usize,
+    ) -> Result<Self> {
         if extent_based {
             Ok(Self::Extent(ExtentManager::new(
+                ino,
                 empty_extent_root(),
                 0,
                 fs,
@@ -119,11 +156,19 @@ impl BlockMapping {
             )?))
         } else {
             Ok(Self::Indirect(IndirectManager::new(
+                ino,
                 [0u32; RAW_BLOCK_PTRS_LEN],
                 0,
                 fs,
                 npages,
             )?))
+        }
+    }
+
+    pub(super) fn bind_writeback_target(&self, inode: Weak<Inode>) {
+        match self {
+            Self::Extent(manager) => manager.bind_writeback_target(inode),
+            Self::Indirect(manager) => manager.bind_writeback_target(inode),
         }
     }
 
@@ -138,6 +183,15 @@ impl BlockMapping {
         }
     }
 
+    /// Reclaims volatile extent-cache entries while retaining delayed state.
+    #[expect(dead_code)]
+    pub(super) fn shrink_extent_cache(&self, limit: usize) -> usize {
+        match self {
+            Self::Extent(m) => m.shrink_extent_cache(limit),
+            Self::Indirect(_) => 0,
+        }
+    }
+
     /// Allocates data blocks for every hole in `[start_iblock, end_iblock)`
     /// and records them in the mapping.
     pub(super) fn ensure_allocated(&self, start_iblock: Iblock, end_iblock: Iblock) -> Result<()> {
@@ -149,6 +203,26 @@ impl BlockMapping {
         }
     }
 
+    pub(super) fn prepare_buffered_write(
+        &self,
+        start_iblock: Iblock,
+        end_iblock: Iblock,
+    ) -> Result<BufferedWriteReservation> {
+        match self {
+            Self::Extent(m) if m.uses_delalloc()? => m.reserve_delayed(start_iblock, end_iblock),
+            _ => {
+                self.ensure_allocated(start_iblock, end_iblock)?;
+                Ok(BufferedWriteReservation::default())
+            }
+        }
+    }
+
+    pub(super) fn cancel_buffered_write(&self, reservation: BufferedWriteReservation) {
+        if let Self::Extent(m) = self {
+            m.cancel_delayed(reservation);
+        }
+    }
+
     /// Preallocates blocks for every hole in `[start_iblock, end_iblock)`
     /// without touching file size. Backs `fallocate`.
     ///
@@ -157,7 +231,10 @@ impl BlockMapping {
     /// state, so it allocates real zeroed blocks (ext2 semantics).
     pub(super) fn preallocate(&self, start_iblock: Iblock, end_iblock: Iblock) -> Result<()> {
         match self {
-            Self::Extent(m) => m.preallocate(start_iblock, end_iblock),
+            Self::Extent(m) => {
+                m.materialize_delayed(start_iblock, end_iblock)?;
+                m.preallocate(start_iblock, end_iblock)
+            }
             Self::Indirect(m) => {
                 m.allocate_range_blocks(start_iblock as usize, end_iblock as usize)
             }
@@ -204,6 +281,33 @@ impl BlockMapping {
         }
     }
 
+    /// Releases blocks only after the inode no longer references them durably.
+    pub(super) fn commit_pending_frees(&self) -> Result<()> {
+        match self {
+            Self::Extent(m) => m.commit_pending_frees(),
+            Self::Indirect(_) => Ok(()),
+        }
+    }
+
+    pub(super) fn drain_nv_data(&self) -> Result<()> {
+        match self {
+            Self::Extent(m) => m.drain_nv_data(),
+            Self::Indirect(_) => Ok(()),
+        }
+    }
+
+    pub(in crate::fs::fs_impls::ext4) fn reclaim_extent_root(
+        &self,
+    ) -> Result<[u32; RAW_BLOCK_PTRS_LEN]> {
+        match self {
+            Self::Extent(m) => Ok(m.root_snapshot()),
+            Self::Indirect(_) => return_errno_with_message!(
+                Errno::EOPNOTSUPP,
+                "NVPool recovery requires extent-mapped inodes"
+            ),
+        }
+    }
+
     /// Returns whether the mapping or `i_blocks` changed since last writeback.
     pub(super) fn is_dirty(&self) -> bool {
         match self {
@@ -247,6 +351,13 @@ impl BlockMapping {
 }
 
 impl BlockAsPageCacheBackend for BlockMapping {
+    fn writeback_observer(&self) -> Option<Arc<dyn PageCacheWritebackObserver>> {
+        match self {
+            Self::Extent(m) => BlockAsPageCacheBackend::writeback_observer(m),
+            Self::Indirect(m) => BlockAsPageCacheBackend::writeback_observer(m),
+        }
+    }
+
     fn submit_read_bio(
         &self,
         idx: usize,
@@ -270,6 +381,13 @@ impl BlockAsPageCacheBackend for BlockMapping {
         match self {
             Self::Extent(m) => m.submit_write_bio(idx, bio_segment, complete_fn, io_batch),
             Self::Indirect(m) => m.submit_write_bio(idx, bio_segment, complete_fn, io_batch),
+        }
+    }
+
+    fn submit_write_pages(&self, pages: Vec<WritebackPage>, io_batch: &mut IoBatch) -> Result<()> {
+        match self {
+            Self::Extent(m) => m.submit_write_pages(pages, io_batch),
+            Self::Indirect(m) => m.submit_write_pages(pages, io_batch),
         }
     }
 }

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
 pub mod device;
+mod flush;
+#[allow(dead_code)] // Used by the subsequent virtio-blk multiqueue integration.
+pub(crate) mod mq;
+mod queue;
 
 use core::mem::offset_of;
 
@@ -31,7 +35,7 @@ bitflags! {
         const DISCARD       = 1 << 13;
         const WRITE_ZEROES  = 1 << 14;
 
-        const ALL_SUPPORTED = Self::BLK_SIZE.bits() | Self::FLUSH.bits();
+        const ALL_SUPPORTED = Self::BLK_SIZE.bits() | Self::FLUSH.bits() | Self::MQ.bits();
     }
 }
 
@@ -188,6 +192,11 @@ impl ConfigManager<VirtioBlockConfig> {
             .unwrap() as usize
     }
 
+    pub(self) fn num_queues(&self) -> u16 {
+        self.read_once::<u16>(offset_of!(VirtioBlockConfig, num_queues))
+            .unwrap()
+    }
+
     pub(self) fn capacity_sectors(&self) -> usize {
         let cap_low = self
             .read_once::<u32>(offset_of!(VirtioBlockConfig, capacity))
@@ -197,5 +206,24 @@ impl ConfigManager<VirtioBlockConfig> {
             .unwrap() as usize;
 
         (cap_high << 32) | cap_low
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::{BlockFeatures, VirtioBlockConfig};
+
+    #[ktest]
+    fn negotiation_retains_offered_mq() {
+        let offered = (BlockFeatures::BLK_SIZE | BlockFeatures::FLUSH | BlockFeatures::MQ).bits();
+
+        assert!(BlockFeatures::negotiated_with_device(offered).contains(BlockFeatures::MQ));
+    }
+
+    #[ktest]
+    fn num_queues_matches_virtio_block_config_layout() {
+        assert_eq!(core::mem::offset_of!(VirtioBlockConfig, num_queues), 34);
     }
 }

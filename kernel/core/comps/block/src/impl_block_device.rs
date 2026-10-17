@@ -74,6 +74,18 @@ impl dyn BlockDevice {
         bio.submit(self, io_batch)
     }
 
+    /// Asynchronously writes contiguous blocks from multiple memory segments.
+    pub fn write_blocks_async_segments(
+        &self,
+        bid: Bid,
+        bio_segments: Vec<BioSegment>,
+        complete_fn: Option<BioCompleteFn>,
+        io_batch: &mut IoBatch,
+    ) -> Result<(), BioEnqueueError> {
+        let bio = Bio::new(BioType::Write, Sid::from(bid), bio_segments, complete_fn);
+        bio.submit(self, io_batch)
+    }
+
     /// Issues a sync request
     pub fn sync(&self) -> Result<BioStatus, BioEnqueueError> {
         let bio = Bio::new(BioType::Flush, Sid::from(Bid::from_offset(0)), vec![], None);

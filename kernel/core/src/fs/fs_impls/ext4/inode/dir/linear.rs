@@ -372,6 +372,34 @@ impl InodeInner {
         return_errno!(Errno::ENOENT)
     }
 
+    /// Reads the live directory entry at an exact byte offset.
+    pub(super) fn entry_info_at(&self, dir_offset: usize) -> Result<Option<DirEntryInfo>> {
+        if dir_offset >= self.file_size() {
+            return Ok(None);
+        }
+        let block_idx = dir_offset / BLOCK_SIZE;
+        let entry_offset = dir_offset % BLOCK_SIZE;
+        let block = DirBlockView::from_index(self.page_cache()?, block_idx, self.file_size());
+        let mut iter = block.iter_entries();
+        while let Some((current_offset, header)) = iter.next_entry_header()? {
+            if current_offset > entry_offset {
+                break;
+            }
+            if current_offset != entry_offset {
+                continue;
+            }
+            if header.ino == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(DirEntryInfo {
+                ino: header.ino,
+                dir_offset,
+                entry_rec_len: usize::from(header.rec_len),
+            }));
+        }
+        Ok(None)
+    }
+
     /// Deletes a located entry by zeroing its inode and merging its space into
     /// the predecessor entry. The first entry in a block (always `.`) has no
     /// predecessor and is never the delete target.

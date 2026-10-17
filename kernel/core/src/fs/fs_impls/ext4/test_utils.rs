@@ -24,11 +24,15 @@ use super::{
     prelude::*,
     super_block::{MAGIC_NUM, RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
 };
-use crate::fs::vfs::file_system::FsFlags;
+use crate::fs::{nv_pool::frame::NvPool, vfs::file_system::FsFlags};
 
 /// An in-memory block device backed by a zeroed frame segment.
 pub(super) struct Ext4MemoryDisk {
     segment: Segment<()>,
+    read_count: AtomicUsize,
+    write_count: AtomicUsize,
+    max_write_segments: AtomicUsize,
+    max_write_segment_bytes: AtomicUsize,
     flush_count: AtomicUsize,
     /// When set, every write bio fails with `IoError`. Lets tests force a
     /// metadata writeback failure (e.g. to exercise `create_inode` rollback).
@@ -44,6 +48,10 @@ impl Ext4MemoryDisk {
             .unwrap();
         Self {
             segment,
+            read_count: AtomicUsize::new(0),
+            write_count: AtomicUsize::new(0),
+            max_write_segments: AtomicUsize::new(0),
+            max_write_segment_bytes: AtomicUsize::new(0),
             flush_count: AtomicUsize::new(0),
             fail_writes: AtomicBool::new(false),
         }
@@ -56,6 +64,26 @@ impl Ext4MemoryDisk {
     /// Makes every subsequent write bio fail (or stops failing them).
     pub(super) fn set_fail_writes(&self, fail: bool) {
         self.fail_writes.store(fail, Ordering::Relaxed);
+    }
+
+    pub(super) fn read_count(&self) -> usize {
+        self.read_count.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn write_count(&self) -> usize {
+        self.write_count.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn max_write_segments(&self) -> usize {
+        self.max_write_segments.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn max_write_segment_bytes(&self) -> usize {
+        self.max_write_segment_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn flush_count(&self) -> usize {
+        self.flush_count.load(Ordering::Relaxed)
     }
 }
 
@@ -78,6 +106,22 @@ impl BlockDevice for Ext4MemoryDisk {
         if bio.type_() == BioType::Write && self.fail_writes.load(Ordering::Relaxed) {
             bio.complete(BioStatus::IoError);
             return Ok(());
+        }
+
+        match bio.type_() {
+            BioType::Read => {
+                self.read_count.fetch_add(1, Ordering::Relaxed);
+            }
+            BioType::Write => {
+                self.write_count.fetch_add(1, Ordering::Relaxed);
+                self.max_write_segments
+                    .fetch_max(bio.segments().len(), Ordering::Relaxed);
+                for segment in bio.segments() {
+                    self.max_write_segment_bytes
+                        .fetch_max(segment.nbytes(), Ordering::Relaxed);
+                }
+            }
+            _ => {}
         }
 
         let mut cur_device_ofs = bio.sid_range().start.to_raw() as usize * SECTOR_SIZE;
@@ -153,6 +197,8 @@ impl Ext4Fixture {
                 &raw.as_bytes()[..self.inode_size.min(size_of::<RawInode>())],
             )
             .unwrap();
+        self.ext4.remove_inode(ino);
+        self.ext4.block_group(0).invalidate_inode_table_block(ino);
     }
 
     /// Reads back the raw inode at inode number `ino` from the group-0 table,
@@ -211,8 +257,13 @@ pub(super) struct Ext4FixtureBuilder {
     /// Extra `compat` feature bits OR'd into the superblock (used to assert
     /// the ext2-flavor journal rejection).
     extra_compat: u32,
+    /// Optional internal JBD2 journal: physical start, block count, s_start.
+    journal: Option<(u32, u16, u32)>,
     /// The type name to mount the fixture volume under; `Ext4` by default.
     flavor: MountFlavor,
+    /// Optional filesystem mount options passed to `Ext4::open`.
+    mount_options: Option<&'static str>,
+    nv_pool: Option<Arc<NvPool>>,
 }
 
 impl Ext4FixtureBuilder {
@@ -231,8 +282,21 @@ impl Ext4FixtureBuilder {
             without_extents: false,
             extra_ro_compat: 0,
             extra_compat: 0,
+            journal: None,
             flavor: MountFlavor::Ext4,
+            mount_options: None,
+            nv_pool: None,
         }
+    }
+
+    pub(super) fn with_mount_options(mut self, options: &'static str) -> Self {
+        self.mount_options = Some(options);
+        self
+    }
+
+    pub(super) fn with_nv_pool(mut self, pool: Arc<NvPool>) -> Self {
+        self.nv_pool = Some(pool);
+        self
     }
 
     /// Reserves an extra group-0 inode (beyond the reserved 1..`first_ino`): its
@@ -260,6 +324,12 @@ impl Ext4FixtureBuilder {
 
     pub(super) fn with_extra_compat(mut self, bits: u32) -> Self {
         self.extra_compat = bits;
+        self
+    }
+
+    pub(super) fn with_journal(mut self, start_block: u32, len: u16, start: u32) -> Self {
+        self.extra_compat |= super::feature::FeatureCompatSet::HAS_JOURNAL.bits();
+        self.journal = Some((start_block, len, start));
         self
     }
 
@@ -300,6 +370,8 @@ impl Ext4FixtureBuilder {
     }
 
     pub(super) fn build(self) -> Result<Ext4Fixture> {
+        crate::time::clocks::init_for_ktest();
+
         let nr_groups = (self.nblocks as u32 - 1) / self.blocks_per_group + 1;
         let inodes_count = nr_groups * self.inodes_per_group;
         let inode_table_blocks = self.inodes_per_group / (BLOCK_SIZE / self.inode_size) as u32;
@@ -385,6 +457,23 @@ impl Ext4FixtureBuilder {
         disk.segment()
             .write_val(SUPER_BLOCK_OFFSET, &raw_sb)
             .unwrap();
+
+        if let Some((journal_start, journal_len, journal_log_start)) = self.journal {
+            let journal_inode = make_multi_block_file_inode(journal_start, journal_len);
+            let journal_inode_offset = INODE_TABLE_BID as usize * BLOCK_SIZE
+                + (super::journal::JOURNAL_INO - 1) as usize * self.inode_size;
+            disk.segment()
+                .write_bytes(
+                    journal_inode_offset,
+                    &journal_inode.as_bytes()[..self.inode_size.min(size_of::<RawInode>())],
+                )
+                .unwrap();
+            let journal_superblock =
+                super::journal::make_test_journal_superblock(journal_len as u32, journal_log_start);
+            disk.segment()
+                .write_bytes(journal_start as usize * BLOCK_SIZE, &journal_superblock)
+                .unwrap();
+        }
 
         // Lay out a descriptor (and, when marking, a block bitmap) per group.
         // Each group `g` keeps its metadata at fixed in-group offsets: block
@@ -481,12 +570,18 @@ impl Ext4FixtureBuilder {
             )
             .unwrap();
 
-        let ext4 = Ext4::open(
-            disk.clone() as Arc<dyn BlockDevice>,
-            FsFlags::empty(),
-            self.flavor,
-            None,
-        )?;
+        let device = disk.clone() as Arc<dyn BlockDevice>;
+        let ext4 = if let Some(pool) = self.nv_pool {
+            Ext4::open_with_nv_pool(
+                device,
+                FsFlags::empty(),
+                self.flavor,
+                self.mount_options,
+                pool,
+            )?
+        } else {
+            Ext4::open(device, FsFlags::empty(), self.flavor, self.mount_options)?
+        };
         Ok(Ext4Fixture {
             disk,
             ext4,
@@ -531,6 +626,26 @@ pub(super) fn make_indirect_file_inode(data_block: u32, size: u32) -> RawInode {
         ..Default::default()
     };
     raw.block[0] = data_block;
+    raw
+}
+
+/// Builds an extent-mapped file with one written extent. Journal tests use it
+/// for the internal inode whose logical blocks are the JBD2 log.
+pub(super) fn make_multi_block_file_inode(data_block: u32, len: u16) -> RawInode {
+    let mut raw = RawInode {
+        mode: 0o100644,
+        size_lo: len as u32 * BLOCK_SIZE as u32,
+        link_count: 1,
+        sector_count: len as u32 * (BLOCK_SIZE / SECTOR_SIZE) as u32,
+        flags: EXTENTS_FL,
+        extra_isize: 32,
+        ..Default::default()
+    };
+    raw.block[0] = 0xF30A | (1 << 16);
+    raw.block[1] = 4;
+    raw.block[3] = 0;
+    raw.block[4] = len as u32;
+    raw.block[5] = data_block;
     raw
 }
 

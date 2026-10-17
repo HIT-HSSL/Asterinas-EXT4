@@ -642,6 +642,12 @@ impl Mount {
         Ok(())
     }
 
+    /// Converts private persistent state into an independently mountable
+    /// backing image before this mount is detached.
+    pub(super) fn drain(&self) -> Result<()> {
+        self.fs.drain()
+    }
+
     pub(super) fn remount(
         &self,
         mount_flags: PerMountFlags,

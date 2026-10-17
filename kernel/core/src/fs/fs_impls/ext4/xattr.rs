@@ -90,6 +90,9 @@ fn xattr_entry_len(name_len: usize) -> usize {
     (name_len + XATTR_ENTRY_HEADER_SIZE + XATTR_ROUND) & !XATTR_ROUND
 }
 
+impl crate::fs::fs_impls::ext4::nv::persistent::Sealed for XattrHeader {}
+impl crate::fs::fs_impls::ext4::nv::persistent::Sealed for XattrEntry {}
+
 fn xattr_value_size(size: usize) -> usize {
     (size + XATTR_ROUND) & !XATTR_ROUND
 }
@@ -404,9 +407,8 @@ impl XattrCache {
 
         let fs = self.fs()?;
         let block_buf = Self::alloc_block_buffer()?;
-
-        let bio_segment = BioSegment::new_from_segment(block_buf.clone(), BioDirection::FromDevice);
-        fs.read_blocks(self.bid, bio_segment)?;
+        let block = fs.read_metadata_block(self.bid)?;
+        block_buf.write_bytes(0, &block)?;
 
         Self::validate_block(&block_buf)?;
         let entries = Self::parse_entries_from_block(&block_buf)?;
@@ -459,9 +461,9 @@ impl XattrCache {
         let fs = self.fs()?;
         let block_buf = self.block_buf.as_ref().unwrap();
         self.write_entries_to_segment(block_buf)?;
-
-        let bio_segment = BioSegment::new_from_segment(block_buf.clone(), BioDirection::ToDevice);
-        fs.write_blocks(self.bid, bio_segment)?;
+        let mut block = [0; BLOCK_SIZE];
+        block_buf.read_bytes(0, &mut block)?;
+        fs.write_metadata_block(self.bid, &block)?;
         self.dirty = false;
         Ok(())
     }
@@ -765,4 +767,115 @@ fn cmp_entry_key(
         .cmp(&(rhs_index as u8))
         .then(lhs_name.len().cmp(&rhs_name.len()))
         .then(lhs_name.cmp(rhs_name))
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+    use crate::{
+        fs::{
+            fs_impls::ext4::test_utils::{Ext4FixtureBuilder, make_empty_file_inode},
+            nv_pool::{
+                config::{NvPoolConfig, NvSimMode},
+                dram::DramNvBackend,
+                frame::NvPool,
+            },
+        },
+        time::clocks,
+    };
+
+    fn nv_pool() -> Arc<NvPool> {
+        let config = NvPoolConfig::from_bytes(
+            Some(8 * PAGE_SIZE),
+            Some(8 * PAGE_SIZE),
+            Some(0),
+            Some(NvSimMode::Fast),
+        )
+        .unwrap()
+        .unwrap();
+        let backend = Arc::new(DramNvBackend::allocate(config).unwrap());
+        Arc::new(NvPool::format(backend, config, None).unwrap())
+    }
+
+    #[ktest]
+    fn xattr_flush_is_reloaded_from_nv_before_ssd_eviction() {
+        let fixture = Ext4FixtureBuilder::new(256, 128, 256)
+            .with_nv_pool(nv_pool())
+            .build()
+            .unwrap();
+        let bid = 100;
+        let mut cache = XattrCache {
+            block_buf: Some(XattrCache::alloc_block_buffer().unwrap()),
+            entries: vec![XattrEntryData {
+                name_index: XattrNameIndex::User,
+                name: b"key".to_vec(),
+                value: b"value".to_vec(),
+            }],
+            bid,
+            dirty: true,
+            inode: Weak::<Inode>::new(),
+            fs: fixture.ext4.this(),
+        };
+        cache.flush().unwrap();
+
+        let mut ssd = [0; BLOCK_SIZE];
+        fixture
+            .disk
+            .segment()
+            .read_bytes(bid as usize * BLOCK_SIZE, &mut ssd)
+            .unwrap();
+        assert_eq!(ssd, [0; BLOCK_SIZE]);
+
+        let mut reloaded = XattrCache {
+            block_buf: None,
+            entries: Vec::new(),
+            bid,
+            dirty: false,
+            inode: Weak::<Inode>::new(),
+            fs: fixture.ext4.this(),
+        };
+        reloaded.load().unwrap();
+        assert_eq!(reloaded.entries.len(), 1);
+        assert_eq!(reloaded.entries[0].name, b"key");
+        assert_eq!(reloaded.entries[0].value, b"value");
+    }
+
+    #[ktest]
+    fn xattr_allocation_and_release_sync_only_the_owning_group() {
+        clocks::init_for_ktest();
+        let fixture = Ext4FixtureBuilder::new(2048, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let ino = 11;
+        fixture.write_raw_inode(ino, &make_empty_file_inode());
+        let inode = fixture.ext4.read_inode(ino).unwrap();
+        let name = XattrName::try_from_full_name("user.task4").unwrap();
+        let value = b"tracked";
+        let before_alloc = fixture.ext4.io_stats().snapshot().scanned_groups;
+        inode
+            .set_xattr(
+                name,
+                &mut VmReader::from(value.as_slice()).to_fallible(),
+                XattrSetFlags::CREATE_OR_REPLACE,
+            )
+            .unwrap();
+        inode.sync_all().unwrap();
+        assert_eq!(
+            fixture.ext4.io_stats().snapshot().scanned_groups - before_alloc,
+            1
+        );
+
+        let before_release = fixture.ext4.io_stats().snapshot().scanned_groups;
+        inode
+            .remove_xattr(XattrName::try_from_full_name("user.task4").unwrap())
+            .unwrap();
+        inode.sync_all().unwrap();
+        assert_eq!(
+            fixture.ext4.io_stats().snapshot().scanned_groups - before_release,
+            1
+        );
+    }
 }

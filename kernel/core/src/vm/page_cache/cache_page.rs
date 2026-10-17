@@ -151,6 +151,25 @@ pub(crate) trait CachePageExt: Sized {
         self.wait_queue().wake_all();
     }
 
+    /// Waits for an in-flight writeback without holding the page lock.
+    fn wait_until_finish_writing_back(&self) {
+        self.wait_queue().wait_until(|| {
+            (!self.metadata().is_writing_back.load(Ordering::Acquire)).then_some(())
+        });
+    }
+
+    /// Restores dirty state after asynchronous writeback failure.
+    ///
+    /// Completion callbacks cannot acquire the page lock, so this transition
+    /// is deliberately atomic and conservative. A concurrent writer may have
+    /// already dirtied the page; storing `Dirty` preserves that state too.
+    fn mark_writeback_failed(&self) {
+        self.metadata()
+            .state
+            .store(PageState::Dirty, Ordering::Release);
+        self.clear_writing_back();
+    }
+
     /// Allocates a new cache page which content and state are uninitialized.
     fn alloc_uninit() -> Result<CachePage> {
         let meta = CachePageMeta::default();
@@ -313,14 +332,6 @@ impl<PageRef: Borrow<CachePage>> LockedCachePage<PageRef> {
             .store(true, Ordering::Release);
     }
 
-    /// Waits until the page finishes writing back to storage.
-    ///
-    /// This function will wait on the same wait queue used for locking the page.
-    pub(crate) fn wait_until_finish_writing_back(&self) {
-        self.wait_queue
-            .wait_until(|| (!self.is_writing_back()).then_some(()));
-    }
-
     /// Checks if the page is currently being written back to storage.
     pub(super) fn is_writing_back(&self) -> bool {
         self.metadata().is_writing_back.load(Ordering::Acquire)
@@ -328,6 +339,16 @@ impl<PageRef: Borrow<CachePage>> LockedCachePage<PageRef> {
 }
 
 impl LockedCachePage<CachePage> {
+    /// Waits for writeback without holding the page lock, then reacquires it.
+    pub(crate) fn wait_until_finish_writing_back(self) -> Self {
+        if !self.is_writing_back() {
+            return self;
+        }
+        let page = self.unlock();
+        page.wait_until_finish_writing_back();
+        page.lock()
+    }
+
     /// Unlocks the page and returns the underlying cache page.
     pub(crate) fn unlock(mut self) -> CachePage {
         let page = self.page.take().expect("page already taken");

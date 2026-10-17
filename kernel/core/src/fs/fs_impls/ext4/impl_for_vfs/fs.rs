@@ -22,15 +22,47 @@ impl FileSystem for Ext4 {
     }
 
     fn sync(&self) -> Result<()> {
-        // Flush every cached inode together with the block-side metadata, then
-        // issue a single device barrier. Unmount drives durability through this
-        // hook (`Path::unmount` -> `Mount::sync` -> `FileSystem::sync`), so a
-        // clean unmount flushes every dirty inode and the bitmap consistently.
-        self.sync_all()?;
-        if self.block_device().sync()? != BioStatus::Complete {
-            return_errno_with_message!(Errno::EIO, "failed to flush block device");
-        }
-        Ok(())
+        // Flush every cached inode together with the block-side metadata. A
+        // conventional mount then issues one device barrier; an NVPool mount
+        // has already crossed its persistence boundary through NV commits.
+        self.writeback_controller().with_submissions_quiesced(|| {
+            self.sync_all()?;
+            self.writeback_controller().drain()?;
+            // NVPool commits are the persistence boundary for sync/syncfs.
+            // Only the conventional SSD-authoritative path needs a device
+            // barrier here; clean unmount still drains NV state below.
+            if !self.uses_nv_pool()
+                && !self.uses_journal()
+                && self.block_device().sync()? != BioStatus::Complete
+            {
+                return_errno_with_message!(Errno::EIO, "failed to flush block device");
+            }
+            self.report_writeback_pipeline_stats();
+            Ok(())
+        })
+    }
+
+    fn drain(&self) -> Result<()> {
+        self.writeback_controller().with_submissions_quiesced(|| {
+            self.sync_all()?;
+            self.writeback_controller().drain()?;
+            if let Some(journal) = self.journal() {
+                journal.checkpoint_all()?;
+            }
+            if self.block_device().sync()? != BioStatus::Complete {
+                return_errno_with_message!(Errno::EIO, "failed to flush block device");
+            }
+            if self.uses_nv_pool() {
+                self.drain_nv_data()?;
+                let nv_state = self
+                    .nv_state()
+                    .expect("NVPool mount must retain its persistent state");
+                nv_state.drain_all_metadata()?;
+                self.finish_nv_drain()?;
+            }
+            self.report_writeback_pipeline_stats();
+            Ok(())
+        })
     }
 
     fn root_inode(&self) -> Arc<dyn Inode> {

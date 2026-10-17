@@ -12,9 +12,8 @@ use ostd::sync::{SpinLock, WaitQueue};
 /// to return the ID to the ID allocator.
 ///
 /// This ID allocator is designed for use by device drivers.
-/// The `alloc` method should only be called in the task context,
-/// whereas the `dealloc` method should only be used in the IRQ handler of a device driver.
-/// Failing to conform with the above requirement may result in deadlock.
+/// The `alloc` method should only be called in task context because it may block.
+/// The non-blocking `dealloc` method may be called in either task or IRQ context.
 pub struct SyncIdAlloc {
     wait_queue: WaitQueue,
     id_allocator: SpinLock<IdAlloc>,
@@ -40,7 +39,7 @@ impl SyncIdAlloc {
 
     /// Deallocates an ID.
     ///
-    /// This method assumes that the caller is in the context of an IRQ handler.
+    /// This method may be called in task or IRQ context and does not block.
     ///
     /// # Panics
     ///

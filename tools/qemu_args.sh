@@ -22,8 +22,14 @@
 #  - VNC_PORT: VNC port, default is "42";
 #  - ATTACH_EXT4_IMAGE: "true" or "false", whether to attach the ext
 #    regression image and mount-flavor matrix images.
+#  - ATTACH_DEFAULT_TEST_IMAGES: "true" or "false", whether to attach the
+#    ext2, exfat, LTP, and emulated NVMe regression images.
 #  - XFSTESTS_NEEDS_BLOCK_DEVICES: "true" or "false", whether to attach
 #    xfstests images (xfstests_test.img and xfstests_scratch.img) to the VM.
+#  - RESEARCH_BLOCK_BACKEND: optional raw image or host block-device path to
+#    expose as a dedicated virtio-blk research disk.
+#  - RESEARCH_BLOCK_IOTHREADS: number of QEMU IOThreads dedicated to the
+#    research disk. Use 0 to keep QEMU's default AioContext.
 
 OVMF=${OVMF:-"on"}
 VHOST=${VHOST:-"off"}
@@ -32,10 +38,50 @@ VIRTIOFS=${VIRTIOFS:-"off"}
 NETDEV=${NETDEV:-"user"}
 CONSOLE=${CONSOLE:-"hvc0"}
 ATTACH_EXT4_IMAGE=${ATTACH_EXT4_IMAGE:-false}
+ATTACH_DEFAULT_TEST_IMAGES=${ATTACH_DEFAULT_TEST_IMAGES:-true}
 XFSTESTS_NEEDS_BLOCK_DEVICES=${XFSTESTS_NEEDS_BLOCK_DEVICES:-false}
+RESEARCH_BLOCK_BACKEND=${RESEARCH_BLOCK_BACKEND:-}
+RESEARCH_BLOCK_CACHE=${RESEARCH_BLOCK_CACHE:-none}
+RESEARCH_BLOCK_AIO=${RESEARCH_BLOCK_AIO:-threads}
+RESEARCH_BLOCK_QUEUE_SIZE=${RESEARCH_BLOCK_QUEUE_SIZE:-1024}
+RESEARCH_BLOCK_NUM_QUEUES=${RESEARCH_BLOCK_NUM_QUEUES:-1}
+RESEARCH_BLOCK_IOTHREADS=${RESEARCH_BLOCK_IOTHREADS:-0}
+QEMU_ARGS_FORMAT=${QEMU_ARGS_FORMAT:-shell}
+
+case "$QEMU_ARGS_FORMAT" in
+    shell|nul) ;;
+    *) echo "Invalid QEMU_ARGS_FORMAT=$QEMU_ARGS_FORMAT" 1>&2; exit 1 ;;
+esac
+# NUL argv output is an internal interface for the two array-based consumers below.
+if [ "$QEMU_ARGS_FORMAT" = nul ]; then
+    case "${1:-}" in
+        normal|common) ;;
+        *) echo "QEMU_ARGS_FORMAT=nul only supports normal and common schemes" 1>&2; exit 1 ;;
+    esac
+fi
+
+emit_qemu_args() {
+    local qemu_args=$1
+    if [ "$QEMU_ARGS_FORMAT" = shell ]; then
+        # Preserve the historical whitespace-collapsed shell output for OSDK callers.
+        # shellcheck disable=SC2086
+        echo $qemu_args
+        return
+    fi
+
+    local -a qemu_argv
+    read -r -a qemu_argv <<<"$qemu_args"
+    printf '%s\0' "${qemu_argv[@]}"
+}
 
 if [ "$ATTACH_EXT4_IMAGE" != "true" ] && [ "$ATTACH_EXT4_IMAGE" != "false" ]; then
     echo "Invalid ATTACH_EXT4_IMAGE=${ATTACH_EXT4_IMAGE}" 1>&2
+    exit 1
+fi
+
+if [ "$ATTACH_DEFAULT_TEST_IMAGES" != "true" ] && \
+   [ "$ATTACH_DEFAULT_TEST_IMAGES" != "false" ]; then
+    echo "Invalid ATTACH_DEFAULT_TEST_IMAGES=${ATTACH_DEFAULT_TEST_IMAGES}" 1>&2
     exit 1
 fi
 
@@ -46,6 +92,94 @@ if [ "$XFSTESTS_NEEDS_BLOCK_DEVICES" != "true" ] && \
 fi
 VIRTIOFS_TAG=${VIRTIOFS_TAG:-"aster-virtiofs"}
 VIRTIOFS_SOCKET=${VIRTIOFS_SOCKET:-"/tmp/vhostqemu/vfs.sock"}
+
+RESEARCH_BLOCK_DRIVE_ARGS=""
+RESEARCH_BLOCK_Q35_DEVICE_ARGS=""
+RESEARCH_BLOCK_MICROVM_DEVICE_ARGS=""
+RESEARCH_BLOCK_IOTHREAD_ARGS=""
+if [ -n "$RESEARCH_BLOCK_BACKEND" ]; then
+    [[ "$RESEARCH_BLOCK_BACKEND" =~ ^[-+._/a-zA-Z0-9]+$ ]] || {
+        echo "Invalid RESEARCH_BLOCK_BACKEND path" 1>&2
+        exit 1
+    }
+    [[ "$RESEARCH_BLOCK_CACHE" =~ ^(none|directsync|writeback|unsafe)$ ]] || {
+        echo "Invalid RESEARCH_BLOCK_CACHE=$RESEARCH_BLOCK_CACHE" 1>&2
+        exit 1
+    }
+    [[ "$RESEARCH_BLOCK_AIO" =~ ^(native|threads|io_uring)$ ]] || {
+        echo "Invalid RESEARCH_BLOCK_AIO=$RESEARCH_BLOCK_AIO" 1>&2
+        exit 1
+    }
+    [[ "$RESEARCH_BLOCK_QUEUE_SIZE" =~ ^[1-9][0-9]*$ ]] || {
+        echo "Invalid RESEARCH_BLOCK_QUEUE_SIZE=$RESEARCH_BLOCK_QUEUE_SIZE" 1>&2
+        exit 1
+    }
+    [[ "$RESEARCH_BLOCK_NUM_QUEUES" =~ ^[1-9][0-9]*$ ]] || {
+        echo "Invalid RESEARCH_BLOCK_NUM_QUEUES=$RESEARCH_BLOCK_NUM_QUEUES" 1>&2
+        exit 1
+    }
+    [[ "$RESEARCH_BLOCK_IOTHREADS" =~ ^[0-9]+$ ]] || {
+        echo "Invalid RESEARCH_BLOCK_IOTHREADS=$RESEARCH_BLOCK_IOTHREADS" 1>&2
+        exit 1
+    }
+    if [ "$RESEARCH_BLOCK_IOTHREADS" -ne 0 ] && \
+       [ "$RESEARCH_BLOCK_IOTHREADS" -ne "$RESEARCH_BLOCK_NUM_QUEUES" ]; then
+        echo "RESEARCH_BLOCK_IOTHREADS must be 0 or match RESEARCH_BLOCK_NUM_QUEUES" 1>&2
+        exit 1
+    fi
+
+    RESEARCH_BLOCK_IOTHREAD_MAPPING=""
+    for ((queue = 0; queue < RESEARCH_BLOCK_IOTHREADS; queue++)); do
+        RESEARCH_BLOCK_IOTHREAD_ARGS+=" -object iothread,id=research-io$queue"
+        [ -z "$RESEARCH_BLOCK_IOTHREAD_MAPPING" ] || RESEARCH_BLOCK_IOTHREAD_MAPPING+=","
+        RESEARCH_BLOCK_IOTHREAD_MAPPING+="{\"iothread\":\"research-io$queue\",\"vqs\":[$queue]}"
+    done
+
+    RESEARCH_BLOCK_DRIVE_ARGS="-drive if=none,format=raw,id=research,file=$RESEARCH_BLOCK_BACKEND,cache=$RESEARCH_BLOCK_CACHE,aio=$RESEARCH_BLOCK_AIO"
+    if [ -n "$RESEARCH_BLOCK_IOTHREAD_MAPPING" ]; then
+        RESEARCH_BLOCK_Q35_DEVICE_JSON="{\"driver\":\"virtio-blk-pci\",\"bus\":\"pcie.0\",\"addr\":\"0x1e\",\"drive\":\"research\",\"serial\":\"vresearch\",\"disable-legacy\":\"on\",\"disable-modern\":false,\"queue-size\":$RESEARCH_BLOCK_QUEUE_SIZE,\"num-queues\":$RESEARCH_BLOCK_NUM_QUEUES,\"request-merging\":false,\"backend_defaults\":\"off\",\"discard\":false,\"write-zeroes\":false,\"event_idx\":false,\"indirect_desc\":false,\"queue_reset\":false,\"iothread-vq-mapping\":[$RESEARCH_BLOCK_IOTHREAD_MAPPING]}"
+        if [ "$QEMU_ARGS_FORMAT" = shell ]; then
+            RESEARCH_BLOCK_Q35_DEVICE_ARGS="-device '$RESEARCH_BLOCK_Q35_DEVICE_JSON'"
+        else
+            RESEARCH_BLOCK_Q35_DEVICE_ARGS="-device $RESEARCH_BLOCK_Q35_DEVICE_JSON"
+        fi
+    else
+        RESEARCH_BLOCK_Q35_DEVICE_ARGS="-device virtio-blk-pci,bus=pcie.0,addr=0x1e,drive=research,serial=vresearch,disable-legacy=on,disable-modern=off,queue-size=$RESEARCH_BLOCK_QUEUE_SIZE,num-queues=$RESEARCH_BLOCK_NUM_QUEUES,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off"
+    fi
+    RESEARCH_BLOCK_MICROVM_DEVICE_ARGS="-device virtio-blk-device,drive=research,serial=vresearch"
+fi
+
+if [ "$1" = microvm ] && [ "$RESEARCH_BLOCK_IOTHREADS" -ne 0 ]; then
+    echo "RESEARCH_BLOCK_IOTHREADS is only supported by the Q35 research device" 1>&2
+    exit 1
+fi
+
+DEFAULT_TEST_DRIVE_ARGS=""
+DEFAULT_TEST_Q35_DEVICE_ARGS=""
+DEFAULT_TEST_MICROVM_DEVICE_ARGS=""
+DEFAULT_TEST_RISCV_DEVICE_ARGS=""
+DEFAULT_TEST_NVME_ARGS=""
+if [ "$ATTACH_DEFAULT_TEST_IMAGES" = "true" ]; then
+    DEFAULT_TEST_DRIVE_ARGS="\
+        -drive if=none,format=raw,id=x0,file=./test/initramfs/build/ext2.img \
+        -drive if=none,format=raw,id=x1,file=./test/initramfs/build/exfat.img \
+        -drive if=none,format=raw,id=x2,file=./test/initramfs/build/ltp_dev.img"
+    DEFAULT_TEST_Q35_DEVICE_ARGS="\
+        -device virtio-blk-pci,bus=pcie.0,addr=0x6,drive=x0,serial=vext2,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x7,drive=x1,serial=vexfat,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x8,drive=x2,serial=vltpdev,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off"
+    DEFAULT_TEST_MICROVM_DEVICE_ARGS="\
+        -device virtio-blk-device,drive=x0,serial=vext2 \
+        -device virtio-blk-device,drive=x1,serial=vexfat \
+        -device virtio-blk-device,drive=x2,serial=vltpdev"
+    DEFAULT_TEST_RISCV_DEVICE_ARGS="\
+        -device virtio-blk-device,drive=x2 \
+        -device virtio-blk-device,drive=x1 \
+        -device virtio-blk-device,drive=x0"
+    DEFAULT_TEST_NVME_ARGS="\
+        -drive if=none,format=raw,id=nvme0n1,file=./test/initramfs/build/nvme0n1.img \
+        -device nvme,drive=nvme0n1,serial=nvme0n1"
+fi
 
 # Draw all host ports from a single `shuf` invocation,
 # so that none of them will conflict with others.
@@ -110,18 +244,14 @@ if [ "$1" = "riscv" ]; then
         -monitor chardev:mux \
         -chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log \
         $ROOTFS_DRIVE_ARGS \
-        -drive if=none,format=raw,id=x0,file=./test/initramfs/build/ext2.img \
-        -drive if=none,format=raw,id=x1,file=./test/initramfs/build/exfat.img \
-        -drive if=none,format=raw,id=x2,file=./test/initramfs/build/ltp_dev.img \
+        $DEFAULT_TEST_DRIVE_ARGS \
         $ROOTFS_RISCV_DEVICE_ARGS \
-        -device virtio-blk-device,drive=x2 \
-        -device virtio-blk-device,drive=x1 \
-        -device virtio-blk-device,drive=x0 \
+        $DEFAULT_TEST_RISCV_DEVICE_ARGS \
         -device virtio-keyboard-device \
         -device virtio-serial-device \
         $CONSOLE_ARGS \
     "
-    echo $QEMU_ARGS
+    emit_qemu_args "$QEMU_ARGS"
     exit 0
 fi
 
@@ -142,13 +272,9 @@ if [ "$1" = "tdx" ]; then
         -cpu host,-kvm-steal-time,pmu=off \
         -machine q35,kernel-irqchip=split,confidential-guest-support=tdx0 \
         -object '$TDX_OBJECT' \
-        -drive if=none,format=raw,id=x0,file=./test/initramfs/build/ext2.img \
-        -drive if=none,format=raw,id=x1,file=./test/initramfs/build/exfat.img \
-        -drive if=none,format=raw,id=x2,file=./test/initramfs/build/ltp_dev.img \
+        $DEFAULT_TEST_DRIVE_ARGS \
         $ROOTFS_DRIVE_ARGS \
-        -device virtio-blk-pci,bus=pcie.0,addr=0x6,drive=x0,serial=vext2,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
-        -device virtio-blk-pci,bus=pcie.0,addr=0x7,drive=x1,serial=vexfat,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
-        -device virtio-blk-pci,bus=pcie.0,addr=0x8,drive=x2,serial=vltpdev,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        $DEFAULT_TEST_Q35_DEVICE_ARGS \
         $ROOTFS_TDX_DEVICE_ARGS \
         -device virtio-net-pci,netdev=net01,disable-legacy=on,disable-modern=off$VIRTIO_NET_FEATURES \
         -device virtio-keyboard-pci,disable-legacy=on,disable-modern=off \
@@ -161,7 +287,7 @@ if [ "$1" = "tdx" ]; then
         -monitor chardev:mux \
         -d guest_errors \
     "
-    echo $QEMU_ARGS
+    emit_qemu_args "$QEMU_ARGS"
     exit 0
 fi
 
@@ -177,9 +303,9 @@ COMMON_QEMU_ARGS="\
     $NETDEV_ARGS \
     $QEMU_OPT_ARG_DUMP_PACKETS \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-    -drive if=none,format=raw,id=x0,file=./test/initramfs/build/ext2.img \
-    -drive if=none,format=raw,id=x1,file=./test/initramfs/build/exfat.img \
-    -drive if=none,format=raw,id=x2,file=./test/initramfs/build/ltp_dev.img \
+    $DEFAULT_TEST_DRIVE_ARGS \
+    $RESEARCH_BLOCK_DRIVE_ARGS \
+    $RESEARCH_BLOCK_IOTHREAD_ARGS \
     $ROOTFS_DRIVE_ARGS \
 "
 
@@ -217,6 +343,10 @@ if [ "$1" = "iommu" ]; then
     # TODO: Add support for enabling IOMMU on AMD platforms
 fi
 
+if [ "$ATTACH_DEFAULT_TEST_IMAGES" = "true" ] && [ -n "$IOMMU_DEV_EXTRA" ]; then
+    DEFAULT_TEST_Q35_DEVICE_ARGS=${DEFAULT_TEST_Q35_DEVICE_ARGS//queue_reset=off/queue_reset=off$IOMMU_DEV_EXTRA}
+fi
+
 if [ "$INITRAMFS" = "off" ]; then
     ROOTFS_MICROVM_DEVICE_ARGS="-device virtio-blk-device,drive=rootfs,serial=vrootfs"
     ROOTFS_Q35_DEVICE_ARGS="-device virtio-blk-pci,bus=pcie.0,addr=0xc,drive=rootfs,serial=vrootfs,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA"
@@ -228,9 +358,8 @@ if [ "$1" = "microvm" ]; then
         -machine microvm,rtc=on \
         -nodefaults \
         -no-user-config \
-        -device virtio-blk-device,drive=x0,serial=vext2 \
-        -device virtio-blk-device,drive=x1,serial=vexfat \
-        -device virtio-blk-device,drive=x2,serial=vltpdev \
+        $DEFAULT_TEST_MICROVM_DEVICE_ARGS \
+        $RESEARCH_BLOCK_MICROVM_DEVICE_ARGS \
         $ROOTFS_MICROVM_DEVICE_ARGS \
         -device virtio-keyboard-device \
         -device virtio-net-device,netdev=net01 \
@@ -241,16 +370,14 @@ else
     QEMU_ARGS="\
         $COMMON_QEMU_ARGS \
         -machine q35,kernel-irqchip=split \
-        -device virtio-blk-pci,bus=pcie.0,addr=0x6,drive=x0,serial=vext2,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
-        -device virtio-blk-pci,bus=pcie.0,addr=0x7,drive=x1,serial=vexfat,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
-        -device virtio-blk-pci,bus=pcie.0,addr=0x8,drive=x2,serial=vltpdev,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        $DEFAULT_TEST_Q35_DEVICE_ARGS \
+        $RESEARCH_BLOCK_Q35_DEVICE_ARGS \
         $ROOTFS_Q35_DEVICE_ARGS \
         -object rng-random,id=rng0,filename=/dev/urandom \
         -device virtio-rng-pci,bus=pcie.0,addr=0x9,disable-legacy=on,disable-modern=off,rng=rng0,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
         -device virtio-net-pci,netdev=net01,disable-legacy=on,disable-modern=off$VIRTIO_NET_FEATURES$IOMMU_DEV_EXTRA \
         -device virtio-serial-pci,disable-legacy=on,disable-modern=off$IOMMU_DEV_EXTRA \
-        -drive if=none,format=raw,id=nvme0n1,file=./test/initramfs/build/nvme0n1.img \
-        -device nvme,drive=nvme0n1,serial=nvme0n1 \
+        $DEFAULT_TEST_NVME_ARGS \
         $CONSOLE_ARGS \
         $IOMMU_EXTRA_ARGS \
     "
@@ -356,4 +483,4 @@ if [ "$OVMF" = "on" ]; then
     fi
 fi
 
-echo $QEMU_ARGS
+emit_qemu_args "$QEMU_ARGS"

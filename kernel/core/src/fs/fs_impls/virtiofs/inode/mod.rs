@@ -39,7 +39,7 @@ use super::{
 };
 use crate::{
     fs::{
-        file::{AccessMode, InodeMode, InodeType, PerOpenFileOps, StatusFlags},
+        file::{AccessMode, InodeMode, InodeType, PerOpenFileOps, StatusFlags, SyncMode},
         utils::DirentVisitor,
         vfs::{
             file_system::FileSystem,
@@ -147,7 +147,7 @@ impl VirtioFsInode {
         })
     }
 
-    fn fs_ref(&self) -> Arc<VirtioFs> {
+    pub(super) fn fs_ref(&self) -> Arc<VirtioFs> {
         self.fs.upgrade().unwrap()
     }
 
@@ -182,16 +182,6 @@ impl VirtioFsInode {
         *self.entry_valid_until.lock() =
             valid_until(entry_reply.entry_valid(), entry_reply.entry_valid_nsec());
         Ok(())
-    }
-
-    fn lookup_child_inode(&self, name: &str) -> Result<Arc<VirtioFsInode>> {
-        let fs = self.fs_ref();
-        let request_attr_version = fs.session().snapshot_attr_version();
-        let lookup_reply = fs
-            .session()
-            .do_fuse_op(self.nodeid(), LookupOperation::new(name))?;
-
-        fs.lookup_inode_from_cache(lookup_reply, request_attr_version)
     }
 
     fn type_(&self) -> InodeType {
@@ -434,9 +424,9 @@ impl Inode for VirtioFsInode {
         Ok(())
     }
 
-    fn unlink(&self, name: &str) -> Result<()> {
+    fn unlink(&self, name: &str, child: &Arc<dyn Inode>) -> Result<()> {
         let fs = self.fs_ref();
-        let child = self.lookup_child_inode(name)?;
+        let child = child.downcast_ref::<VirtioFsInode>().unwrap();
 
         fs.session()
             .do_fuse_op(self.nodeid(), UnlinkOperation::new(name))?;
@@ -447,9 +437,9 @@ impl Inode for VirtioFsInode {
         Ok(())
     }
 
-    fn rmdir(&self, name: &str) -> Result<()> {
+    fn rmdir(&self, name: &str, child: &Arc<dyn Inode>) -> Result<()> {
         let fs = self.fs_ref();
-        let child = self.lookup_child_inode(name)?;
+        let child = child.downcast_ref::<VirtioFsInode>().unwrap();
 
         fs.session()
             .do_fuse_op(self.nodeid(), RmdirOperation::new(name))?;
@@ -503,7 +493,7 @@ impl Inode for VirtioFsInode {
         Ok(())
     }
 
-    fn sync_data(&self) -> Result<()> {
+    fn sync(&self, _mode: SyncMode) -> Result<()> {
         let inner = self.inner.write();
         let Some(page_cache) = &inner.page_cache else {
             return Ok(());

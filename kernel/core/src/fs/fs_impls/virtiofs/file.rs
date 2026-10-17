@@ -2,7 +2,7 @@
 
 //! Open regular-file handles for `virtiofs`.
 
-use aster_fuse::FuseOpenFlags;
+use aster_fuse::{FsyncFlags, FuseOpenFlags};
 use ostd::warn;
 
 use super::{
@@ -12,8 +12,8 @@ use super::{
 use crate::{
     events::IoEvents,
     fs::{
-        file::{PerOpenFileOps, StatusFlags},
-        vfs::inode::FileOps,
+        file::{PerOpenFileOps, StatusFlags, SyncMode},
+        vfs::inode::{FileOps, Inode},
     },
     prelude::*,
     process::signal::{PollHandle, Pollable},
@@ -156,6 +156,23 @@ impl PerOpenFileOps for VirtioFsFile {
         self.inode.revalidate_attr(Some(self.open_handle.fh()))?;
 
         Ok(Some(self.inode.size()))
+    }
+
+    fn sync(&self, mode: SyncMode) -> Result<()> {
+        self.inode.sync(mode)?;
+
+        let fsync_flags = match mode {
+            SyncMode::Data => FsyncFlags::FDATASYNC,
+            SyncMode::Full => FsyncFlags::empty(),
+        };
+
+        self.inode.fs_ref().session().fsync(
+            self.inode.nodeid(),
+            self.open_handle.fh(),
+            fsync_flags,
+        )?;
+
+        Ok(())
     }
 }
 

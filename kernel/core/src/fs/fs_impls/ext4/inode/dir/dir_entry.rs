@@ -23,6 +23,8 @@ pub(super) struct DirEntry<'a> {
     pub name: &'a [u8],
 }
 
+impl crate::fs::fs_impls::ext4::nv::persistent::Sealed for DirEntryHeader {}
+
 /// Directory entry file type (`ext4_dir_entry_2.file_type`).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromInt)]
@@ -139,7 +141,7 @@ impl<'a> DirBlockView<'a> {
     }
 
     /// Reads and validates an entry header at absolute page-cache `offset`.
-    fn read_header(&self, offset: usize) -> Result<DirEntryHeader> {
+    pub(super) fn read_header(&self, offset: usize) -> Result<DirEntryHeader> {
         let header: DirEntryHeader = self
             .page_cache
             .read_val(offset)

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 # SPDX-License-Identifier: MPL-2.0
 
@@ -6,7 +6,7 @@
 #
 # Usage: ./run.sh [nixos | iso]
 
-set -e
+set -euo pipefail
 
 usage() {
     echo "Usage: $0 [nixos | iso]"
@@ -33,20 +33,22 @@ fi
 cd "${ASTERINAS_DIR}"
 
 # Get base QEMU arguments from qemu_args.sh script
-QEMU_ARGS=$(${ASTERINAS_DIR}/tools/qemu_args.sh common 2>/dev/null)
+mapfile -d "" -t QEMU_ARGS < <(
+    QEMU_ARGS_FORMAT=nul "${ASTERINAS_DIR}/tools/qemu_args.sh" common 2>/dev/null
+)
 
 # Add mode-specific disk and device arguments
 case "$MODE" in
     nixos)
         NIXOS_DIR="${ASTERINAS_DIR}/target/nixos"
-        QEMU_ARGS="${QEMU_ARGS} \
-            -drive if=none,format=raw,id=u0,file=${NIXOS_DIR}/asterinas.img \
-            -device virtio-blk-pci,drive=u0,disable-legacy=on,disable-modern=off \
-        "
+        QEMU_ARGS+=(
+            -drive "if=none,format=raw,id=u0,file=${NIXOS_DIR}/asterinas.img"
+            -device "virtio-blk-pci,drive=u0,disable-legacy=on,disable-modern=off"
+        )
         ;;
     iso)
         ASTER_IMAGE_PATH=${ASTERINAS_DIR}/target/nixos/asterinas.img
-        NIXOS_DISK_SIZE_IN_MB=${NIXOS_DISK_SIZE_IN_MB:-8192}
+        NIXOS_DISK_SIZE_IN_MB=${NIXOS_DISK_SIZE_IN_MB:-16384}
         ISO_IMAGE_PATH=$(find "${ASTERINAS_DIR}/target/nixos/iso_image/iso" -name "*.iso" | head -n 1)
 
         if [ ! -f "$ISO_IMAGE_PATH" ]; then
@@ -59,19 +61,19 @@ case "$MODE" in
         dd if=/dev/zero of="${ASTER_IMAGE_PATH}" bs=1M count=${NIXOS_DISK_SIZE_IN_MB} status=none
         echo "Image created successfully!"
 
-        QEMU_ARGS="${QEMU_ARGS} \
-            -cdrom ${ISO_IMAGE_PATH} -boot d \
-            -drive if=none,format=raw,id=u0,file=${ASTER_IMAGE_PATH} \
-            -device virtio-blk-pci,drive=u0,disable-legacy=on,disable-modern=off \
-        "
+        QEMU_ARGS+=(
+            -cdrom "$ISO_IMAGE_PATH" -boot d
+            -drive "if=none,format=raw,id=u0,file=${ASTER_IMAGE_PATH}"
+            -device "virtio-blk-pci,drive=u0,disable-legacy=on,disable-modern=off"
+        )
         ;;
     *)
         usage
         ;;
 esac
 
-if [ "${ENABLE_KVM}" = "1" ]; then
-    QEMU_ARGS="${QEMU_ARGS} -accel kvm"
+if [ "${ENABLE_KVM:-0}" = "1" ]; then
+    QEMU_ARGS+=(-accel kvm)
 fi
 
 QEMU_BIN=${QEMU_BIN:-qemu-system-${TARGET_ARCH}}
@@ -84,15 +86,14 @@ KERNEL_SUCCESS_EXIT_CODE=16 # 0x10 in hexadecimal
 QEMU_SUCCESS_EXIT_CODE=$(((KERNEL_SUCCESS_EXIT_CODE << 1) | 1))
 
 # Execute QEMU
-# shellcheck disable=SC2086
-${QEMU_BIN} ${QEMU_ARGS} || exit_code=$?
+"${QEMU_BIN}" "${QEMU_ARGS[@]}" || exit_code=$?
 exit_code=${exit_code:-0}
 
 # Check if the execution was successful:
 # - Exit code 0: Normal successful exit (e.g., ACPI shutdown or clean termination)
 # - Exit code $QEMU_SUCCESS_EXIT_CODE: Kernel signaled success via isa-debug-exit device
-if [ ${exit_code} -eq 0 ] || [ ${exit_code} -eq ${QEMU_SUCCESS_EXIT_CODE} ]; then
+if [ "${exit_code}" -eq 0 ] || [ "${exit_code}" -eq "${QEMU_SUCCESS_EXIT_CODE}" ]; then
     exit 0
 fi
 
-exit ${exit_code}
+exit "${exit_code}"

@@ -16,7 +16,9 @@ use super::{
 use crate::{
     device::{Device, DeviceType},
     fs::{
-        file::{AccessMode, InodeMode, InodeType, PerOpenFileOps, Permission, StatusFlags},
+        file::{
+            AccessMode, InodeMode, InodeType, PerOpenFileOps, Permission, StatusFlags, SyncMode,
+        },
         utils::DirentVisitor,
         vfs::path::Path,
     },
@@ -442,11 +444,11 @@ pub(crate) trait Inode: Any + FileOps + Send + Sync {
         Err(Error::new(Errno::ENOTDIR))
     }
 
-    fn unlink(&self, name: &str) -> Result<()> {
+    fn unlink(&self, name: &str, child: &Arc<dyn Inode>) -> Result<()> {
         Err(Error::new(Errno::ENOTDIR))
     }
 
-    fn rmdir(&self, name: &str) -> Result<()> {
+    fn rmdir(&self, name: &str, child: &Arc<dyn Inode>) -> Result<()> {
         Err(Error::new(Errno::ENOTDIR))
     }
 
@@ -474,11 +476,7 @@ pub(crate) trait Inode: Any + FileOps + Send + Sync {
         Err(Error::new(Errno::EISDIR))
     }
 
-    fn sync_all(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn sync_data(&self) -> Result<()> {
+    fn sync(&self, _mode: SyncMode) -> Result<()> {
         Ok(())
     }
 

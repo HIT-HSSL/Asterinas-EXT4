@@ -57,7 +57,7 @@ impl BioRequestSingleQueue {
     ///
     /// This method will wake up the waiter if a new `BioRequest` is enqueued.
     pub fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
-        if bio.segments().len() >= self.max_nr_segments_per_bio {
+        if bio.segments().len() > self.max_nr_segments_per_bio {
             return Err(BioEnqueueError::TooBig);
         }
 
@@ -240,5 +240,65 @@ impl From<SubmittedBio> for BioRequest {
                 bios
             },
         }
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use device_id::DeviceId;
+    use io_util::batch::IoBatch;
+    use ostd::prelude::ktest;
+
+    use super::*;
+    use crate::{
+        BlockDevice, BlockDeviceMeta,
+        bio::{Bio, BioDirection, BioSegment},
+    };
+
+    #[derive(Debug)]
+    struct QueueDevice {
+        queue: BioRequestSingleQueue,
+    }
+
+    impl BlockDevice for QueueDevice {
+        fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            self.queue.enqueue(bio)
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: self.queue.max_nr_segments_per_bio(),
+                nr_sectors: usize::MAX,
+            }
+        }
+
+        fn name(&self) -> &str {
+            "queue-test"
+        }
+
+        fn id(&self) -> DeviceId {
+            DeviceId::null()
+        }
+    }
+
+    fn write_bio(nsegments: usize) -> Bio {
+        let segments = (0..nsegments)
+            .map(|_| BioSegment::alloc(1, BioDirection::ToDevice))
+            .collect();
+        Bio::new(BioType::Write, Sid::from_offset(0), segments, None)
+    }
+
+    #[ktest]
+    fn segment_limit_is_inclusive() {
+        let device = QueueDevice {
+            queue: BioRequestSingleQueue::with_max_nr_segments_per_bio(2),
+        };
+        let mut io_batch = IoBatch::with_capacity(1);
+
+        assert!(write_bio(2).submit(&device, &mut io_batch).is_ok());
+        assert_eq!(
+            write_bio(3).submit(&device, &mut io_batch).unwrap_err(),
+            BioEnqueueError::TooBig
+        );
     }
 }

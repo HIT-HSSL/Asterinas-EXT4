@@ -11,7 +11,7 @@ ENABLE_KVM ?= 1
 INTEL_TDX ?= 0
 MEM ?= 8G
 OVMF ?= on
-RELEASE ?= 0
+RELEASE ?= 1
 RELEASE_LTO ?= 0
 LOG_LEVEL ?= error
 SCHEME ?= ""
@@ -48,12 +48,27 @@ AUTO_TEST ?= none
 ENABLE_CONFORMANCE_TEST ?= false
 CONFORMANCE_TEST_SUITE ?= ltp
 CONFORMANCE_TEST_WORKDIR ?= /tmp
-# Whitespace-separated extra blocklist paths for conformance runners.
+# Comma-separated extra blocklists for conformance runners.
 # - `gvisor` treats each entry as a directory relative to its runner directory,
 #   and loads a per-test blocklist file from that directory.
 # - `kselftest` treats each entry as a blocklist file relative to its runner
 #   directory, and appends that file directly.
-EXTRA_BLOCKLISTS ?= ""
+CONFORMANCE_TEST_EXTRA_BLOCKLISTS ?= ""
+# Comma-separated tests to run within the selected conformance suite.
+#
+# This variable allows one to select one or multiple tests to run.
+# When this environment variable is present,
+# the blocklist of a conformance test will be ignored.
+#
+# - gvisor:    a test *binary* name, e.g. `epoll_test` (narrow the cases inside
+#              it with `CONFORMANCE_TEST_GVISOR_FILTER`).
+# - kselftest: a `<collection>:<case>` entry, e.g. `timers:posix_timers`.
+# - ltp:       a syscall testcase id, e.g. `rename01`.
+# - xfstests:  a test id, e.g. `generic/001`.
+CONFORMANCE_TEST_SELECTOR ?= ""
+# gVisor-only positive gtest filter, applied inside one selected gVisor test
+# binary, e.g. `EpollTest.CloseFile:EpollTest.Oneshot`.
+CONFORMANCE_TEST_GVISOR_FILTER ?= ""
 # Parameters for xfstests.
 XFSTESTS_FS_TYPE ?= ext2
 XFSTESTS_RUNLIST ?= short.list
@@ -73,7 +88,7 @@ DNS_SERVER ?= none
 # End of network settings
 
 # NixOS settings
-NIXOS_DISK_SIZE_IN_MB ?= 8192
+NIXOS_DISK_SIZE_IN_MB ?= 16384
 NIXOS_DISABLE_SYSTEMD ?= false
 # The following option is only effective when NIXOS_DISABLE_SYSTEMD is set to 'true'.
 # Use a login shell to ensure that environment variables are initialized correctly.
@@ -117,7 +132,9 @@ ifeq ($(AUTO_TEST), conformance)
 ENABLE_CONFORMANCE_TEST := true
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="CONFORMANCE_TEST_SUITE=$(CONFORMANCE_TEST_SUITE)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="CONFORMANCE_TEST_WORKDIR=$(CONFORMANCE_TEST_WORKDIR)"
-CARGO_OSDK_BUILD_ARGS += --kcmd-args="EXTRA_BLOCKLISTS=$(EXTRA_BLOCKLISTS)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="CONFORMANCE_TEST_EXTRA_BLOCKLISTS=$(CONFORMANCE_TEST_EXTRA_BLOCKLISTS)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="CONFORMANCE_TEST_SELECTOR=$(CONFORMANCE_TEST_SELECTOR)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="CONFORMANCE_TEST_GVISOR_FILTER=$(CONFORMANCE_TEST_GVISOR_FILTER)"
 ifeq ($(CONFORMANCE_TEST_SUITE), xfstests)
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_FS_TYPE=$(XFSTESTS_FS_TYPE)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_RUNLIST=$(XFSTESTS_RUNLIST)"

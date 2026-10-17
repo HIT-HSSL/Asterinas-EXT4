@@ -78,7 +78,7 @@ impl PageCacheBackend for VirtioFsInode {
         locked_page: LockedCachePage,
         io_batch: &mut IoBatch,
     ) -> Result<()> {
-        locked_page.wait_until_finish_writing_back();
+        let locked_page = locked_page.wait_until_finish_writing_back();
 
         let page_start = page_offset(idx)?;
         let file_size = self.size();
@@ -128,12 +128,14 @@ impl PageCacheBackend for VirtioFsInode {
         );
 
         let complete_fn = move |status| {
-            complete_page.clear_writing_back();
             if let FuseCompletion::MalformedResponse | FuseCompletion::RemoteError(_) = status {
+                complete_page.mark_writeback_failed();
                 ostd::error!(
-                    "virtiofs writeback failed for page index {}; data may be lost",
+                    "virtiofs writeback failed for page index {}; page redirtied",
                     idx
                 );
+            } else {
+                complete_page.clear_writing_back();
             }
             // Keep the handle alive until the request completes
             // or until the completion closure is dropped on submission failure.

@@ -18,6 +18,7 @@ use crate::{
     fs::{
         file::{
             CreationFlags, InodeHandle, InodeMode, InodeType, OpenArgs, Permission, StatusFlags,
+            SyncMode,
         },
         pseudofs::NsInode,
         vfs::{
@@ -417,7 +418,7 @@ impl Path {
             return_errno_with_message!(Errno::EINVAL, "the path is not in this mount namespace");
         }
 
-        self.mount.sync()?;
+        self.mount.drain()?;
 
         let mut topology_guard = MountTopology::write_lock();
         let Some(mountpoint) = self.mount.mountpoint() else {
@@ -724,8 +725,7 @@ impl Path {
 #[inherit_methods(from = "self.inode()")]
 impl Path {
     pub(crate) fn fs(&self) -> Arc<dyn FileSystem>;
-    pub(crate) fn sync_all(&self) -> Result<()>;
-    pub(crate) fn sync_data(&self) -> Result<()>;
+    pub(crate) fn sync(&self, mode: SyncMode) -> Result<()>;
     pub(crate) fn metadata(&self) -> Result<Metadata>;
     pub(crate) fn mode(&self) -> Result<InodeMode>;
     pub(crate) fn set_mode(&self, mode: InodeMode) -> Result<()>;

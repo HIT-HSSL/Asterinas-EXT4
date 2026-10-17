@@ -17,7 +17,7 @@ pub(super) use io_util::batch::IoBatch;
 pub(super) use ostd::{
     const_assert,
     mm::{Frame, FrameAllocOptions, PAGE_SIZE, Segment, USegment, VmIo, VmIoFill, VmWriter},
-    sync::{Mutex, MutexGuard, RwMutex, RwMutexReadGuard},
+    sync::{Mutex, RwMutex, RwMutexReadGuard},
 };
 
 pub(super) use super::{
@@ -31,5 +31,7 @@ pub(super) use crate::{
     },
     prelude::*,
     time::UnixTime,
-    vm::page_cache::{BlockAsPageCacheBackend, PageCache, PageCacheBackend},
+    vm::page_cache::{
+        BlockAsPageCacheBackend, PageCache, PageCacheBackend, WritebackPage, submit_writeback_run,
+    },
 };

@@ -13,7 +13,7 @@ use aster_util::{field_ptr, safe_ptr::SafePtr};
 use bitflags::bitflags;
 use ostd::{
     debug,
-    mm::{HasPaddr, PodOnce, Split, dma::DmaCoherent},
+    mm::{HasPaddr, PAGE_SIZE, PodOnce, Split, dma::DmaCoherent},
 };
 
 use crate::{
@@ -80,6 +80,21 @@ pub enum PopUsedError {
     NotReady,
 }
 
+const MAX_QUEUE_SIZE: u16 = 1024;
+
+fn modern_queue_frame_counts(size: u16) -> (usize, usize, usize) {
+    let size = usize::from(size);
+    let descriptor_bytes = size_of::<Descriptor>() * size;
+    let available_bytes = size_of::<u16>() * (3 + size);
+    let used_bytes = size_of::<u16>() * 3 + size_of::<UsedElem>() * size;
+
+    (
+        descriptor_bytes.div_ceil(PAGE_SIZE),
+        available_bytes.div_ceil(PAGE_SIZE),
+        used_bytes.div_ceil(PAGE_SIZE),
+    )
+}
+
 #[derive(Debug)]
 struct DescriptorSlot {
     /// The device-visible descriptor stored in DMA-coherent memory.
@@ -125,7 +140,7 @@ impl VirtQueue {
             // need, but it can be increased in the future if necessary.
             if !device_queue_size.is_power_of_two()
                 || size as usize > device_queue_size
-                || device_queue_size > 1024
+                || device_queue_size > usize::from(MAX_QUEUE_SIZE)
             {
                 return Err(CreationError::InvalidArgs);
             }
@@ -163,14 +178,17 @@ impl VirtQueue {
                 .max_queue_size(idx)
                 .map_err(CreationError::Transport)? as usize;
 
-            // There can be a maximum of 256 descriptors on one page.
-            if size as usize > max_queue_size || size > 256 {
+            if size as usize > max_queue_size || size > MAX_QUEUE_SIZE {
                 return Err(CreationError::InvalidArgs);
             }
 
-            let desc_frame = DmaCoherent::alloc(1, true).map_err(CreationError::ResourceAlloc)?;
-            let avail_frame = DmaCoherent::alloc(1, true).map_err(CreationError::ResourceAlloc)?;
-            let used_frame = DmaCoherent::alloc(1, true).map_err(CreationError::ResourceAlloc)?;
+            let (desc_frames, avail_frames, used_frames) = modern_queue_frame_counts(size);
+            let desc_frame =
+                DmaCoherent::alloc(desc_frames, true).map_err(CreationError::ResourceAlloc)?;
+            let avail_frame =
+                DmaCoherent::alloc(avail_frames, true).map_err(CreationError::ResourceAlloc)?;
+            let used_frame =
+                DmaCoherent::alloc(used_frames, true).map_err(CreationError::ResourceAlloc)?;
 
             (
                 SafePtr::new(Arc::new(desc_frame), 0),
@@ -625,3 +643,17 @@ bitflags! {
 }
 
 impl PodOnce for AvailFlags {}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::modern_queue_frame_counts;
+
+    #[ktest]
+    fn modern_queue_allocates_enough_frames_for_each_split_ring() {
+        assert_eq!(modern_queue_frame_counts(64), (1, 1, 1));
+        assert_eq!(modern_queue_frame_counts(256), (1, 1, 1));
+        assert_eq!(modern_queue_frame_counts(1024), (4, 1, 3));
+    }
+}
